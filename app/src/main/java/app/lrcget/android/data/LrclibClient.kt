@@ -97,7 +97,7 @@ class LrclibClient {
         return runCatching {
             val responseCode = connection.responseCode
             if (responseCode == 200) {
-                connection.inputStream.bufferedReader().use { it.readText() }
+                connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
             } else {
                 android.util.Log.e("LrclibClient", "HTTP error $responseCode for $url")
                 null

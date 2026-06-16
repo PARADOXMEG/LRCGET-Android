@@ -3,10 +3,26 @@
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
+    <!-- Circle Background -->
     <path
-        android:fillColor="#D6F7DE"
-        android:pathData="M30,30h48a8,8 0,0 1,8 8v32a8,8 0,0 1,-8 8H30a8,8 0,0 1,-8 -8V38a8,8 0,0 1,8 -8z" />
+        android:fillColor="#FF2E7D32"
+        android:pathData="M54,12C30.8,12 12,30.8 12,54s18.8,42 42,42s42,-18.8 42,-42S77.2,12 54,12z" />
+
+    <!-- Lyrics/Music Sheet Icon Body -->
     <path
-        android:fillColor="#103827"
-        android:pathData="M36,44h36v5H36zM36,56h26v5H36zM36,68h32v5H36z" />
+        android:fillColor="#FFFFFF"
+        android:pathData="M34,30 L66,30 C68,30 70,32 70,34 L70,74 C70,76 68,78 66,78 L34,78 C32,78 30,76 30,74 L30,34 C30,32 32,30 34,30 Z" />
+
+    <!-- Musical Note on the sheet -->
+    <path
+        android:fillColor="#2E7D32"
+        android:pathData="M58,40 L44,43 V60 C43,59.5 42,59 41,59 C39,59 37,60.5 37,62.5 C37,64.5 39,66 41,66 C43,66 45,64.5 45,62.5 V48 L55,46 V58 C54,57.5 53,57 52,57 C50,57 48,58.5 48,60.5 C48,62.5 50,64 52,64 C54,64 56,62.5 56,60.5 V40 Z" />
+
+    <!-- Text Lines (Lyrics) -->
+    <path
+        android:fillColor="#2E7D32"
+        android:pathData="M36,68 L64,68 L64,70 L36,70 Z" />
+    <path
+        android:fillColor="#2E7D32"
+        android:pathData="M36,72 L58,72 L58,74 L36,74 Z" />
 </vector>

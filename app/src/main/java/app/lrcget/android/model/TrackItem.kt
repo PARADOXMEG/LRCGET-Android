@@ -47,6 +47,7 @@ data class TrackItem(
     val subtitle: String = "",
     val hasLyrics: Boolean = false,
     val hasSyncedLyrics: Boolean = false,
+    val isInstrumental: Boolean = false,
     val status: LyricsStatus = LyricsStatus.Ready,
     val message: String = ""
 )

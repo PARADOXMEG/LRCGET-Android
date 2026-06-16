@@ -36,23 +36,26 @@ class LyricsDownloadService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val rootUri = intent?.getStringExtra(EXTRA_ROOT_URI)?.let(Uri::parse)
-        if (rootUri == null) {
+        val rootUriString = intent?.getStringExtra(EXTRA_ROOT_URI)
+        if (rootUriString == null) {
             stopSelf(startId)
             return START_NOT_STICKY
         }
+        val rootUri = Uri.parse(rootUriString)
 
         val downloadMode = DownloadMode.valueOf(
             intent.getStringExtra(EXTRA_DOWNLOAD_MODE) ?: DownloadMode.MissingAny.name
         )
+        val isExport = intent.getBooleanExtra(EXTRA_IS_EXPORT, false)
         val searchDelay = intent.getIntExtra(EXTRA_SEARCH_DELAY, 2)
         val outputModesStrings = intent.getStringArrayExtra(EXTRA_OUTPUT_MODES) ?: arrayOf(LyricsOutputMode.LrcFile.name)
         val outputModes = outputModesStrings.map { LyricsOutputMode.valueOf(it) }.toSet()
 
-        startForegroundCompat(buildNotification("Preparing lyrics download", 0, 0, true))
+        val notificationTitle = if (isExport) "Exporting lyrics" else "Finding lyrics"
+        startForegroundCompat(buildNotification(notificationTitle, 0, 0, true))
         activeJob?.cancel()
         activeJob = scope.launch {
-            runDownload(rootUri, downloadMode, outputModes, searchDelay)
+            runDownload(rootUri, downloadMode, outputModes, searchDelay, isExport)
             stopSelf(startId)
         }
 
@@ -71,11 +74,19 @@ class LyricsDownloadService : Service() {
         rootUri: Uri,
         downloadMode: DownloadMode,
         outputModes: Set<LyricsOutputMode>,
-        searchDelay: Int
+        searchDelay: Int,
+        isExport: Boolean
     ) {
         val repository = MusicLibraryRepository(this)
-        notificationManager.notify(notificationId(), buildNotification("Scanning music folder", 0, 0, true))
-        val tracks = repository.scan(rootUri)
+        val initialTitle = if (isExport) "Preparing export" else "Scanning music folder"
+        notificationManager.notify(notificationId(), buildNotification(initialTitle, 0, 0, true))
+        
+        val tracks = repository.scan(rootUri) { current, total ->
+            notificationManager.notify(
+                notificationId(), 
+                buildNotification("Scanning music files", current, total, false)
+            )
+        }
 
         if (tracks.isEmpty()) {
             notificationManager.notify(notificationId(), buildNotification("No supported music files found", 0, 0, false))
@@ -96,13 +107,26 @@ class LyricsDownloadService : Service() {
         var failed = 0
 
         tracksToProcess.forEachIndexed { index, track ->
+            val trackAction = if (isExport) "Saving" else "Finding"
             notificationManager.notify(
                 notificationId(),
-                buildNotification("Downloading ${track.title}", index, tracksToProcess.size, false)
+                buildNotification("$trackAction ${track.title}", index + 1, tracksToProcess.size, false)
             )
 
-            when (repository.download(track, downloadMode == DownloadMode.All, outputModes).status) {
-                LyricsStatus.Saved -> saved += 1
+            val status = if (isExport) {
+                val lyrics = repository.getLyricsResultForTrack(track)
+                if (lyrics != null) {
+                    repository.saveManualLyrics(track, lyrics, true, outputModes).status
+                } else {
+                    LyricsStatus.Missing
+                }
+            } else {
+                val lyrics = repository.getLyricsResultForTrack(track)
+                if (lyrics != null) LyricsStatus.Found else LyricsStatus.Missing
+            }
+
+            when (status) {
+                LyricsStatus.Saved, LyricsStatus.Found -> saved += 1
                 LyricsStatus.Missing -> missing += 1
                 LyricsStatus.Skipped -> skipped += 1
                 LyricsStatus.Failed -> failed += 1
@@ -114,7 +138,8 @@ class LyricsDownloadService : Service() {
             }
         }
 
-        val summary = "Saved $saved, missing $missing, skipped $skipped, failed $failed"
+        val summaryPrefix = if (isExport) "Saved" else "Found"
+        val summary = "$summaryPrefix $saved, missing $missing, skipped $skipped, failed $failed"
         notificationManager.notify(notificationId(), buildNotification(summary, tracksToProcess.size, tracksToProcess.size, false))
     }
 
@@ -141,9 +166,9 @@ class LyricsDownloadService : Service() {
             .setContentTitle("LRCGET")
             .setContentText(text)
             .setContentIntent(contentIntent)
-            .setOngoing(progress < max || indeterminate)
+            .setOngoing(progress < max || max == 0 || indeterminate)
             .setOnlyAlertOnce(true)
-            .setProgress(max, progress, indeterminate)
+            .setProgress(max, progress, indeterminate || (max == 0 && progress == 0))
             .build()
     }
 
@@ -163,6 +188,7 @@ class LyricsDownloadService : Service() {
         private const val NOTIFICATION_ID = 1001
         private const val EXTRA_ROOT_URI = "root_uri"
         private const val EXTRA_DOWNLOAD_MODE = "download_mode"
+        private const val EXTRA_IS_EXPORT = "is_export"
         private const val EXTRA_OUTPUT_MODES = "output_modes"
         private const val EXTRA_SEARCH_DELAY = "search_delay"
 
@@ -174,10 +200,12 @@ class LyricsDownloadService : Service() {
             downloadMode: DownloadMode,
             outputModes: Set<LyricsOutputMode>,
             searchDelay: Int,
+            isExport: Boolean = false
         ) {
             val intent = Intent(context, LyricsDownloadService::class.java)
                 .putExtra(EXTRA_ROOT_URI, rootUri.toString())
                 .putExtra(EXTRA_DOWNLOAD_MODE, downloadMode.name)
+                .putExtra(EXTRA_IS_EXPORT, isExport)
                 .putExtra(EXTRA_OUTPUT_MODES, outputModes.map { it.name }.toTypedArray())
                 .putExtra(EXTRA_SEARCH_DELAY, searchDelay)
 

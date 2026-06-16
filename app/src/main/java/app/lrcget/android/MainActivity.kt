@@ -3,24 +3,44 @@ package app.lrcget.android
 import android.Manifest
 import android.app.Activity
 import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.BackHandler
+import androidx.activity.compose.PredictiveBackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.collectIsDraggedAsState
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.isSystemInDarkTheme
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -39,7 +59,11 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.core.view.WindowCompat
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.net.toUri
@@ -50,7 +74,8 @@ import app.lrcget.android.model.LyricsOutputMode
 import app.lrcget.android.model.LyricsStatus
 import app.lrcget.android.model.ThemeMode
 import app.lrcget.android.model.TrackItem
-import app.lrcget.android.service.LyricsDownloadService
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -112,12 +137,13 @@ private fun LrcgetTheme(
                 surface = Color.Black,
                 background = Color.Black,
                 surfaceVariant = Color(0xFF1A1A1A),
-                surfaceContainer = Color.Black,
-                surfaceContainerLow = Color.Black,
+                surfaceContainer = Color(0xFF0D0D0D),
+                surfaceContainerLow = Color(0xFF080808),
                 surfaceContainerLowest = Color.Black,
                 surfaceContainerHigh = Color(0xFF1A1A1A),
                 surfaceContainerHighest = Color(0xFF222222),
                 outline = Color(0xFF333333),
+                outlineVariant = Color(0xFF222222),
                 onSurface = Color.White,
                 onBackground = Color.White
             )
@@ -131,7 +157,10 @@ private fun LrcgetTheme(
         LaunchedEffect(darkTheme) {
             val window = (context as Activity).window
             window.statusBarColor = Color.Transparent.toArgb()
-            WindowCompat.getInsetsController(window, view).isAppearanceLightStatusBars = !darkTheme
+            window.navigationBarColor = Color.Transparent.toArgb()
+            val insetsController = WindowCompat.getInsetsController(window, view)
+            insetsController.isAppearanceLightStatusBars = !darkTheme
+            insetsController.isAppearanceLightNavigationBars = !darkTheme
         }
     }
 
@@ -143,12 +172,32 @@ private fun LrcgetTheme(
 private fun MainScreen(viewModel: MainViewModel) {
     val state by viewModel.state.collectAsState()
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val pagerState = rememberPagerState(initialPage = 0, pageCount = { 3 })
+    val isDragged by pagerState.interactionSource.collectIsDraggedAsState()
 
-    BackHandler(enabled = state.selectedTab != 0) {
-        if (state.selectedTab == 2) {
-            viewModel.setSelectedTab(if (state.previousTab == 2) 0 else state.previousTab)
-        } else {
-            viewModel.setSelectedTab(0)
+    LaunchedEffect(state.selectedTab) {
+        if (pagerState.currentPage != state.selectedTab) {
+            pagerState.animateScrollToPage(state.selectedTab)
+        }
+    }
+
+    LaunchedEffect(pagerState.currentPage) {
+        if (isDragged && state.selectedTab != pagerState.currentPage) {
+            viewModel.setSelectedTab(pagerState.currentPage)
+        }
+    }
+
+    PredictiveBackHandler(enabled = state.selectedTab != 0) { progress ->
+        try {
+            progress.collect { }
+            if (state.selectedTab == 2) {
+                viewModel.setSelectedTab(if (state.previousTab == 2) 0 else state.previousTab)
+            } else {
+                viewModel.setSelectedTab(0)
+            }
+        } catch (e: CancellationException) {
+            // Back gesture cancelled
         }
     }
 
@@ -167,6 +216,14 @@ private fun MainScreen(viewModel: MainViewModel) {
         }
     }
 
+    val lrcSaver = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) { uri ->
+        if (uri != null && state.previewLyrics != null) {
+            context.contentResolver.openOutputStream(uri)?.use { output ->
+                output.write(state.previewLyrics!!.toByteArray())
+            }
+        }
+    }
+
     LaunchedEffect(Unit) {
         val permissions = mutableListOf<String>()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -176,6 +233,10 @@ private fun MainScreen(viewModel: MainViewModel) {
             permissions.add(Manifest.permission.READ_EXTERNAL_STORAGE)
         }
         permissionsLauncher.launch(permissions.toTypedArray())
+        
+        if (state.libraryUri == null) {
+            folderPicker.launch(null)
+        }
     }
 
     Scaffold(
@@ -189,16 +250,27 @@ private fun MainScreen(viewModel: MainViewModel) {
                     ) 
                 },
                 navigationIcon = {
-                    if (state.selectedTab == 2) {
-                        IconButton(onClick = { viewModel.setSelectedTab(if (state.previousTab == 2) 0 else state.previousTab) }) {
-                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    if (state.selectedTrackIds.isNotEmpty()) {
+                        IconButton(onClick = viewModel::clearSelection) {
+                            Icon(Icons.Default.Close, contentDescription = "Clear Selection")
                         }
                     }
                 },
                 actions = {
-                    if (state.selectedTab != 2) {
-                        IconButton(onClick = { viewModel.setSelectedTab(2) }) {
-                            Icon(Icons.Default.Settings, contentDescription = "Settings")
+                    if (state.selectedTrackIds.isNotEmpty()) {
+                        IconButton(onClick = viewModel::deleteSelectedLyrics) {
+                            Icon(Icons.Default.Delete, contentDescription = "Delete Lyrics", tint = MaterialTheme.colorScheme.error)
+                        }
+                    } else {
+                        if (state.isDownloadingAll && !state.showDownloadProgress) {
+                            IconButton(onClick = { viewModel.setShowDownloadProgress(true) }) {
+                                Icon(Icons.Default.CloudDownload, contentDescription = "Show Progress", tint = MaterialTheme.colorScheme.primary)
+                            }
+                        }
+                        if (state.libraryUri != null && !state.isDownloadingAll) {
+                            IconButton(onClick = { viewModel.setShowExportDialog(true) }) {
+                                Icon(Icons.Default.Output, contentDescription = "Export Lyrics")
+                            }
                         }
                     }
                 },
@@ -207,6 +279,31 @@ private fun MainScreen(viewModel: MainViewModel) {
                     scrolledContainerColor = MaterialTheme.colorScheme.surfaceContainer
                 )
             )
+        },
+        bottomBar = {
+            NavigationBar(
+                containerColor = MaterialTheme.colorScheme.surfaceContainer,
+                tonalElevation = 3.dp
+            ) {
+                NavigationBarItem(
+                    selected = pagerState.currentPage == 0,
+                    onClick = { viewModel.setSelectedTab(0) },
+                    icon = { Icon(Icons.Default.Lyrics, null) },
+                    label = { Text("Tracks") }
+                )
+                NavigationBarItem(
+                    selected = pagerState.currentPage == 1,
+                    onClick = { viewModel.setSelectedTab(1) },
+                    icon = { Icon(Icons.Default.TravelExplore, null) },
+                    label = { Text("LRCLIB") }
+                )
+                NavigationBarItem(
+                    selected = pagerState.currentPage == 2,
+                    onClick = { viewModel.setSelectedTab(2) },
+                    icon = { Icon(Icons.Default.Settings, null) },
+                    label = { Text("Settings") }
+                )
+            }
         }
     ) { padding ->
         Surface(
@@ -214,127 +311,121 @@ private fun MainScreen(viewModel: MainViewModel) {
                 .padding(padding)
                 .fillMaxSize()
         ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                AnimatedContent(
-                    targetState = state.selectedTab,
-                    transitionSpec = {
-                        if (targetState == 2 || initialState == 2) {
-                            if (targetState == 2) {
-                                (slideInHorizontally { it } + fadeIn()).togetherWith(slideOutHorizontally { -it } + fadeOut())
-                            } else {
-                                (slideInHorizontally { -it } + fadeIn()).togetherWith(slideOutHorizontally { it } + fadeOut())
-                            }
-                        } else {
-                            fadeIn().togetherWith(fadeOut())
-                        }
-                    },
-                    label = "tabTransition",
-                    modifier = Modifier.weight(1f)
-                ) { targetTab ->
-                    Column(
-                        modifier = Modifier.fillMaxSize(),
-                        verticalArrangement = Arrangement.spacedBy(12.dp)
-                    ) {
-                        if (targetTab != 2) {
+            HorizontalPager(
+                state = pagerState,
+                modifier = Modifier.fillMaxSize(),
+                beyondViewportPageCount = 1
+            ) { page ->
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    when (page) {
+                        0 -> {
                             ActionPanel(
                                 tracksSize = state.tracks.size,
                                 savedCount = state.savedCount,
                                 missingCount = state.missingCount,
                                 isBusy = state.isBusy,
+                                isDownloadingAll = state.isDownloadingAll,
                                 hasLibrary = state.libraryUri != null,
                                 message = state.message,
+                                operationProgress = state.operationProgress,
+                                operationTotal = state.operationTotal,
                                 onChooseFolder = { folderPicker.launch(null) },
                                 onScan = viewModel::scan,
                                 onDownload = {
-                                    state.libraryUri?.let { uri ->
+                                    if (state.libraryUri != null) {
                                         viewModel.downloadAll()
-                                        LyricsDownloadService.start(
-                                            context = context,
-                                            rootUri = uri,
-                                            downloadMode = state.downloadMode,
-                                            outputModes = state.outputModes,
-                                            searchDelay = state.searchDelay
-                                        )
                                     }
                                 }
                             )
 
-                            if (state.isBusy) {
-                                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                            val tracks = state.tracks
+                            LazyColumn(
+                                modifier = Modifier.weight(1f),
+                                verticalArrangement = Arrangement.spacedBy(8.dp),
+                                contentPadding = PaddingValues(bottom = 16.dp)
+                            ) {
+                                items(
+                                    items = tracks,
+                                    key = { it.id },
+                                    contentType = { "track" }
+                                ) { track ->
+                                    TrackRow(
+                                        track = track,
+                                        isSelected = state.selectedTrackIds.contains(track.id),
+                                        onToggleSelection = { viewModel.toggleTrackSelection(track.id) },
+                                        onPreview = viewModel::previewLyrics,
+                                        onDownload = viewModel::downloadTrack
+                                    )
+                                }
                             }
+                        }
 
-                            TabRow(selectedTabIndex = targetTab) {
-                                Tab(
-                                    selected = targetTab == 0,
-                                    onClick = { viewModel.setSelectedTab(0) },
-                                    text = { Text("Tracks") }
-                                )
-                                Tab(
-                                    selected = targetTab == 1,
-                                    onClick = { viewModel.setSelectedTab(1) },
-                                    text = { Text("Search") }
+                        1 -> {
+                            Box(modifier = Modifier.weight(1f)) {
+                                ManualSearchPanel(
+                                    state = state,
+                                    onQueryChange = viewModel::setManualSearchQuery,
+                                    onSearch = viewModel::searchLyricsManual,
+                                    onDownload = { lyrics, track ->
+                                        viewModel.downloadManualLyrics(lyrics, track)
+                                    },
+                                    onSaveToLocation = { result ->
+                                        viewModel.selectPreviewLyrics(result.lyrics)
+                                        lrcSaver.launch("${result.artistName} - ${result.trackName}.lrc")
+                                    }
                                 )
                             }
                         }
 
-                        when (targetTab) {
-                            0 -> {
-                                val tracks = state.tracks
-                                LazyColumn(
-                                    modifier = Modifier.weight(1f),
-                                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                                    contentPadding = PaddingValues(bottom = 16.dp)
-                                ) {
-                                    items(
-                                        items = tracks,
-                                        key = { it.id },
-                                        contentType = { "track" }
-                                    ) { track ->
-                                        TrackRow(
-                                            track = track,
-                                            onPreview = viewModel::previewLyrics,
-                                            onDownload = viewModel::downloadTrack
-                                        )
-                                    }
-                                }
-                            }
-
-                            1 -> {
-                                Box(modifier = Modifier.weight(1f)) {
-                                    ManualSearchPanel(
-                                        state = state,
-                                        onSearch = viewModel::searchLyricsManual,
-                                        onDownload = viewModel::downloadManualLyrics
-                                    )
-                                }
-                            }
-
-                            else -> {
-                                Box(modifier = Modifier.weight(1f)) {
-                                    SettingsPanel(
-                                        state = state,
-                                        onToggleOutputMode = viewModel::toggleOutputMode,
-                                        onSearchDelayChanged = viewModel::setSearchDelay,
-                                        onDownloadModeChanged = viewModel::setDownloadMode,
-                                        onThemeModeChanged = viewModel::setThemeMode,
-                                        onAmoledChanged = viewModel::setAmoled
-                                    )
-                                }
+                        2 -> {
+                            Box(modifier = Modifier.weight(1f)) {
+                                SettingsPanel(
+                                    state = state,
+                                    onToggleOutputMode = viewModel::toggleOutputMode,
+                                    onSearchDelayChanged = viewModel::setSearchDelay,
+                                    onDownloadModeChanged = viewModel::setDownloadMode,
+                                    onThemeModeChanged = viewModel::setThemeMode,
+                                    onAmoledChanged = viewModel::setAmoled,
+                                    onAddLibrary = { folderPicker.launch(null) },
+                                    onRemoveLibrary = viewModel::removeLibrary
+                                )
                             }
                         }
                     }
                 }
             }
 
+            if (state.showExportDialog) {
+                ExportDialog(
+                    outputModes = state.outputModes,
+                    onToggleMode = viewModel::toggleOutputMode,
+                    onExport = {
+                        viewModel.setShowExportDialog(false)
+                        viewModel.exportAll()
+                    },
+                    onDismiss = { viewModel.setShowExportDialog(false) }
+                )
+            }
+
+            if (state.showDownloadProgress) {
+                DownloadProgressDialog(
+                    state = state,
+                    onStop = viewModel::stopDownload,
+                    onMinimize = { viewModel.setShowDownloadProgress(false) },
+                    onDismiss = { viewModel.setShowDownloadProgress(false) }
+                )
+            }
+
             if (state.previewTrack != null) {
                 LyricsPreviewDialog(
                     track = state.previewTrack,
                     results = state.previewResults,
+                    isBusy = state.isBusy,
                     onSearch = viewModel::searchLyricsForPreview,
                     onSave = { lyrics ->
                         state.previewTrack?.let { track ->
@@ -349,13 +440,102 @@ private fun MainScreen(viewModel: MainViewModel) {
 }
 
 @Composable
+private fun DownloadProgressDialog(
+    state: MainUiState,
+    onStop: () -> Unit,
+    onMinimize: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            val title = if (state.message.contains("Exporting")) "Exporting Lyrics" else "Finding Lyrics"
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(title, style = MaterialTheme.typography.headlineSmall)
+                IconButton(onClick = onMinimize) {
+                    Icon(Icons.Default.Close, contentDescription = "Minimize")
+                }
+            }
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                LinearProgressIndicator(
+                    progress = { if (state.operationTotal > 0) state.operationProgress.toFloat() / state.operationTotal else 0f },
+                    modifier = Modifier.fillMaxWidth().height(8.dp).clip(MaterialTheme.shapes.medium)
+                )
+                
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text("${state.foundCount} FOUND", style = MaterialTheme.typography.labelSmall)
+                    Text("${state.notFoundCount} NOT FOUND", style = MaterialTheme.typography.labelSmall)
+                    Text("${state.operationTotal} TOTAL", style = MaterialTheme.typography.labelSmall)
+                }
+
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(200.dp)
+                        .background(MaterialTheme.colorScheme.surfaceVariant, MaterialTheme.shapes.small)
+                        .padding(8.dp)
+                ) {
+                    LazyColumn {
+                        items(state.downloadLog) { log ->
+                            Text(
+                                log, 
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (log.contains("No lyrics") || log.contains("Failed") || log.contains("NotFound")) 
+                                    MaterialTheme.colorScheme.error 
+                                else 
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Button(
+                    onClick = onStop,
+                    enabled = state.isDownloadingAll,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFFB71C1C),
+                        contentColor = Color.White
+                    ),
+                    shape = MaterialTheme.shapes.extraLarge,
+                    modifier = Modifier.padding(bottom = 8.dp)
+                ) {
+                    Text("STOP")
+                }
+            }
+        },
+        dismissButton = {
+            if (!state.isDownloadingAll) {
+                TextButton(onClick = onDismiss) {
+                    Text("CLOSE")
+                }
+            }
+        }
+    )
+}
+
+@Composable
 private fun ActionPanel(
     tracksSize: Int,
     savedCount: Int,
     missingCount: Int,
     isBusy: Boolean,
+    isDownloadingAll: Boolean,
     hasLibrary: Boolean,
     message: String,
+    operationProgress: Int,
+    operationTotal: Int,
     onChooseFolder: () -> Unit,
     onScan: () -> Unit,
     onDownload: () -> Unit
@@ -366,55 +546,77 @@ private fun ActionPanel(
         modifier = Modifier.padding(bottom = 4.dp)
     ) {
         Column(
-            modifier = Modifier.padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                FilledTonalButton(
+                IconButton(
                     onClick = onChooseFolder, 
                     enabled = !isBusy,
-                    modifier = Modifier.weight(1f),
-                    contentPadding = PaddingValues(horizontal = 16.dp)
+                    colors = IconButtonDefaults.filledTonalIconButtonColors()
                 ) {
-                    Icon(Icons.Default.Folder, null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(8.dp))
-                    Text("Folder")
+                    Icon(Icons.Default.CreateNewFolder, "Add Folder", modifier = Modifier.size(20.dp))
                 }
-                FilledTonalButton(
+                
+                IconButton(
                     onClick = onScan, 
                     enabled = hasLibrary && !isBusy,
+                    colors = IconButtonDefaults.filledTonalIconButtonColors()
+                ) {
+                    Icon(Icons.Default.Refresh, "Scan", modifier = Modifier.size(20.dp))
+                }
+                
+                Button(
+                    onClick = onDownload,
+                    enabled = tracksSize > 0 && !isBusy,
                     modifier = Modifier.weight(1f),
+                    shape = MaterialTheme.shapes.large,
                     contentPadding = PaddingValues(horizontal = 16.dp)
                 ) {
-                    Icon(Icons.Default.Refresh, null, modifier = Modifier.size(18.dp))
+                    Icon(Icons.Default.Search, null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp))
-                    Text("Scan")
+                    Text("Find Lyrics Online", maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
             }
-            
-            Button(
-                onClick = onDownload,
-                enabled = tracksSize > 0 && !isBusy,
-                modifier = Modifier.fillMaxWidth(),
-                shape = MaterialTheme.shapes.large
-            ) {
-                Icon(Icons.Default.CloudDownload, null)
-                Spacer(Modifier.width(8.dp))
-                Text("Download All Lyrics")
-            }
 
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                LinearProgressIndicator(
-                    progress = { if (tracksSize > 0) savedCount.toFloat() / tracksSize else 0f },
-                    modifier = Modifier.fillMaxWidth().height(8.dp).clip(MaterialTheme.shapes.extraLarge),
-                    trackColor = MaterialTheme.colorScheme.surfaceVariant,
-                    strokeCap = StrokeCap.Round
-                )
-                
+            if (isBusy || isDownloadingAll) {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (operationTotal > 0) {
+                        LinearProgressIndicator(
+                            progress = { operationProgress.toFloat() / operationTotal },
+                            modifier = Modifier.fillMaxWidth().height(8.dp).clip(MaterialTheme.shapes.extraLarge),
+                            trackColor = MaterialTheme.colorScheme.surfaceVariant,
+                            strokeCap = StrokeCap.Round
+                        )
+                    } else {
+                        LinearProgressIndicator(
+                            modifier = Modifier.fillMaxWidth().height(8.dp).clip(MaterialTheme.shapes.extraLarge),
+                            trackColor = MaterialTheme.colorScheme.surfaceVariant,
+                            strokeCap = StrokeCap.Round
+                        )
+                    }
+                    
+                    val progressText = if (isDownloadingAll) {
+                        "Searching lyrics ($operationProgress / $operationTotal)"
+                    } else if (operationTotal > 0) {
+                        "$message ($operationProgress / $operationTotal)"
+                    } else if (operationTotal < 0) {
+                        "Scanning folders: $operationProgress folders, ${-operationTotal} audio files found"
+                    } else {
+                        message
+                    }
+                    
+                    Text(
+                        text = progressText,
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            } else {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween
@@ -435,7 +637,7 @@ private fun ActionPanel(
                 }
             }
 
-            if (message.isNotBlank()) {
+            if (message.isNotBlank() && !message.contains("Scanning") && !isBusy && !isDownloadingAll) {
                 Surface(
                     color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.5f),
                     shape = MaterialTheme.shapes.small
@@ -457,16 +659,19 @@ private fun ActionPanel(
 @Composable
 private fun TrackRow(
     track: TrackItem,
+    isSelected: Boolean,
+    onToggleSelection: () -> Unit,
     onPreview: (TrackItem) -> Unit,
     onDownload: (TrackItem) -> Unit
 ) {
-    val statusLabel = track.status.label()
-    val statusColor = track.status.color()
+    val statusLabel = track.status.label(track)
 
     Surface(
         shape = MaterialTheme.shapes.medium,
-        color = MaterialTheme.colorScheme.surfaceContainer,
-        modifier = Modifier.fillMaxWidth()
+        color = if (isSelected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainer,
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onToggleSelection() }
     ) {
         Row(
             modifier = Modifier
@@ -475,32 +680,53 @@ private fun TrackRow(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = track.title,
-                    style = MaterialTheme.typography.bodyMedium,
-                    fontWeight = FontWeight.SemiBold,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
+            Row(
+                modifier = Modifier.weight(1f),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Checkbox(
+                    checked = isSelected,
+                    onCheckedChange = { onToggleSelection() }
                 )
-                Text(
-                    text = track.subtitle,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
+                Column {
+                    Text(
+                        text = track.title,
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = track.subtitle,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    
+                    if (statusLabel.isNotBlank() || track.isInstrumental) {
+                        @OptIn(ExperimentalLayoutApi::class)
+                        FlowRow(
+                            modifier = Modifier.padding(top = 4.dp),
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            if (track.isInstrumental && !statusLabel.contains("Instrumental", ignoreCase = true)) {
+                                StatusBadge("Instrumental")
+                            }
+                            
+                            statusLabel.split(",").filter { it.isNotBlank() }.forEach { label ->
+                                StatusBadge(label.trim())
+                            }
+                        }
+                    }
+                }
             }
             Row(
-                horizontalArrangement = Arrangement.spacedBy(2.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(
-                    text = statusLabel,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = statusColor,
-                    modifier = Modifier.padding(end = 4.dp)
-                )
                 IconButton(onClick = { onPreview(track) }) {
                     Icon(
                         Icons.Default.Visibility,
@@ -523,13 +749,91 @@ private fun TrackRow(
 }
 
 @Composable
+private fun StatusBadge(text: String) {
+    val (containerColor, contentColor) = when {
+        text.contains("synced", ignoreCase = true) -> 
+            MaterialTheme.colorScheme.primaryContainer to MaterialTheme.colorScheme.onPrimaryContainer
+        text.contains("LRC", ignoreCase = true) -> 
+            MaterialTheme.colorScheme.tertiaryContainer to MaterialTheme.colorScheme.onTertiaryContainer
+        text.contains("plain", ignoreCase = true) || text.contains("Text", ignoreCase = true) -> 
+            MaterialTheme.colorScheme.secondaryContainer to MaterialTheme.colorScheme.onSecondaryContainer
+        text.contains("Deleted", ignoreCase = true) || text.contains("Failed", ignoreCase = true) || text.contains("Missing", ignoreCase = true) -> 
+            MaterialTheme.colorScheme.errorContainer to MaterialTheme.colorScheme.onErrorContainer
+        else -> 
+            MaterialTheme.colorScheme.surfaceVariant to MaterialTheme.colorScheme.onSurfaceVariant
+    }
+
+    Surface(
+        color = containerColor,
+        contentColor = contentColor,
+        shape = MaterialTheme.shapes.extraSmall
+    ) {
+        Text(
+            text = text,
+            modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp),
+            style = MaterialTheme.typography.labelSmall,
+            fontWeight = FontWeight.Bold
+        )
+    }
+}
+
+@Composable
 private fun ManualSearchPanel(
     state: MainUiState,
+    onQueryChange: (String) -> Unit,
     onSearch: (String, String, String) -> Unit,
-    onDownload: (LyricsLookupResult, TrackItem) -> Unit
+    onDownload: (LyricsLookupResult, TrackItem) -> Unit,
+    onSaveToLocation: (LyricsLookupResult) -> Unit
 ) {
+    var query by remember { mutableStateOf(state.manualSearchQuery) }
     var previewResult by remember { mutableStateOf<LyricsLookupResult?>(null) }
-    var selectedTrack by remember { mutableStateOf<TrackItem?>(null) }
+
+    if (state.isDownloadingAll) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(16.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Surface(
+                color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                shape = MaterialTheme.shapes.large,
+                tonalElevation = 2.dp
+            ) {
+                Column(
+                    modifier = Modifier.padding(24.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    Icon(
+                        Icons.Default.Info,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(48.dp)
+                    )
+                    Text(
+                        text = "Manual search is unavailable while 'Find Lyrics Online' is running.",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        textAlign = TextAlign.Center
+                    )
+                    Text(
+                        text = "To search for a specific track now, use the preview icon in the Tracks tab.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        textAlign = TextAlign.Center,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        }
+        return
+    }
+
+    LaunchedEffect(state.manualSearchQuery) {
+        if (state.manualSearchQuery != query) {
+            query = state.manualSearchQuery
+        }
+    }
 
     if (previewResult != null) {
         AlertDialog(
@@ -557,13 +861,11 @@ private fun ManualSearchPanel(
                 }
             },
             confirmButton = {
-                if (selectedTrack != null) {
-                    Button(onClick = {
-                        onDownload(previewResult!!, selectedTrack!!)
-                        previewResult = null
-                    }) {
-                        Text("Save to Selected")
-                    }
+                Button(onClick = {
+                    onSaveToLocation(previewResult!!)
+                    previewResult = null
+                }) {
+                    Text("Save .lrc File")
                 }
             },
             dismissButton = {
@@ -574,111 +876,112 @@ private fun ManualSearchPanel(
         )
     }
 
-    LazyColumn(
-        modifier = Modifier.fillMaxSize(),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
-        item {
-            ManualSearchForm(
-                isSearching = state.isSearching,
-                onSearch = onSearch
-            )
-        }
-
-        if (state.isSearching) {
-            item {
-                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-            }
-        }
-
-        if (state.searchResults.isNotEmpty()) {
-            item {
-                Text("Search Results:", style = MaterialTheme.typography.titleSmall)
-            }
-            items(
-                items = state.searchResults,
-                key = { it.lyrics.hashCode() },
-                contentType = { "lyrics_result" }
-            ) { result ->
-                LyricsResultCard(
-                    result = result,
-                    onPreview = { previewResult = it },
-                    onSave = { 
-                        if (selectedTrack != null) {
-                            onDownload(it, selectedTrack!!)
-                        }
-                    }
-                )
-            }
-        }
-
-        if (state.tracks.isNotEmpty()) {
-            item {
-                Text("Select destination track:", style = MaterialTheme.typography.titleSmall)
-            }
-            items(
-                items = state.tracks,
-                key = { it.id },
-                contentType = { "track_chip" }
-            ) { track ->
-                FilterChip(
-                    selected = selectedTrack?.id == track.id,
-                    onClick = { selectedTrack = track },
-                    label = { Text(track.title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                    modifier = Modifier.fillMaxWidth()
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun ManualSearchForm(
-    isSearching: Boolean,
-    onSearch: (String, String, String) -> Unit
-) {
-    var title by remember { mutableStateOf("") }
-    var artist by remember { mutableStateOf("") }
-    var album by remember { mutableStateOf("") }
-
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text("Search Lyrics", style = MaterialTheme.typography.titleMedium)
-
-        OutlinedTextField(
-            value = title,
-            onValueChange = { title = it },
-            label = { Text("Title") },
-            modifier = Modifier.fillMaxWidth(),
-            singleLine = true
-        )
-
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedTextField(
-                value = album,
-                onValueChange = { album = it },
-                label = { Text("Album") },
-                modifier = Modifier.weight(1f),
-                singleLine = true
-            )
-            OutlinedTextField(
-                value = artist,
-                onValueChange = { artist = it },
-                label = { Text("Artist") },
-                modifier = Modifier.weight(1f),
-                singleLine = true
-            )
-        }
-
-        Button(
-            onClick = { onSearch(title, artist, album) },
-            enabled = title.isNotBlank() && !isSearching,
-            modifier = Modifier.align(Alignment.CenterHorizontally),
-            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFE91E63))
+    Column(modifier = Modifier.fillMaxSize()) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 16.dp, bottom = 8.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            Text("SEARCH")
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Text(
+                    "Search with LRCLIB instance:",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                    shape = MaterialTheme.shapes.extraSmall
+                ) {
+                    Text(
+                        "https://lrclib.net",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                    )
+                }
+            }
+
+            OutlinedTextField(
+                value = query,
+                onValueChange = { 
+                    query = it
+                    onQueryChange(it)
+                },
+                placeholder = { 
+                    Text(
+                        "Song title, artist, or album...",
+                        style = MaterialTheme.typography.bodyMedium
+                    ) 
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 8.dp),
+                shape = MaterialTheme.shapes.extraLarge,
+                singleLine = true,
+                maxLines = 1,
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                keyboardActions = KeyboardActions(
+                    onSearch = {
+                        if (query.isNotBlank()) onSearch(query, "", "")
+                    }
+                ),
+                trailingIcon = {
+                    IconButton(
+                        onClick = { if (query.isNotBlank()) onSearch(query, "", "") },
+                        enabled = query.isNotBlank() && !state.isSearching
+                    ) {
+                        Icon(Icons.Default.Search, contentDescription = "Search")
+                    }
+                },
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedContainerColor = MaterialTheme.colorScheme.surfaceContainerLow,
+                    unfocusedContainerColor = MaterialTheme.colorScheme.surfaceContainerLow,
+                    focusedBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f),
+                    unfocusedBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f)
+                )
+            )
+            
+            if (state.isSearching) {
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth(0.9f))
+            }
+        }
+
+        LazyColumn(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            contentPadding = PaddingValues(bottom = 32.dp)
+        ) {
+            if (state.searchResults.isNotEmpty()) {
+                item {
+                    Text(
+                        "Search Results:", 
+                        style = MaterialTheme.typography.titleSmall,
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)
+                    )
+                }
+                itemsIndexed(
+                    items = state.searchResults,
+                    key = { index, item -> "${index}-${item.trackName}-${item.lyrics.hashCode()}" }
+                ) { _, result ->
+                    Box(modifier = Modifier.padding(horizontal = 16.dp)) {
+                        LyricsResultCard(
+                            result = result,
+                            onPreview = { previewResult = it },
+                            onSave = { onSaveToLocation(it) }
+                        )
+                    }
+                }
+            }
         }
     }
 }
+
 
 @Composable
 private fun SettingsPanel(
@@ -687,13 +990,51 @@ private fun SettingsPanel(
     onSearchDelayChanged: (Int) -> Unit,
     onDownloadModeChanged: (DownloadMode) -> Unit,
     onThemeModeChanged: (ThemeMode) -> Unit,
-    onAmoledChanged: (Boolean) -> Unit
+    onAmoledChanged: (Boolean) -> Unit,
+    onAddLibrary: () -> Unit,
+    onRemoveLibrary: () -> Unit
 ) {
     val context = LocalContext.current
     Column(
         modifier = Modifier.verticalScroll(rememberScrollState()),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Library Management", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            
+            Surface(
+                color = MaterialTheme.colorScheme.surfaceContainerLow,
+                shape = MaterialTheme.shapes.medium
+            ) {
+                Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Music Folder", style = MaterialTheme.typography.bodyLarge)
+                            Text(
+                                text = state.libraryUri?.path?.substringAfterLast('/') ?: "No folder selected",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Row {
+                            IconButton(onClick = onAddLibrary) {
+                                Icon(Icons.Default.Edit, contentDescription = "Change Folder")
+                            }
+                            if (state.libraryUri != null) {
+                                IconButton(onClick = onRemoveLibrary) {
+                                    Icon(Icons.Default.Delete, contentDescription = "Remove Folder", tint = MaterialTheme.colorScheme.error)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("Appearance", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
             
@@ -802,7 +1143,7 @@ private fun SettingsPanel(
             ) {
                 Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
-                        text = "LRCGET Android v0.1.0",
+                        text = "LRCGET Android v1.0.0",
                         style = MaterialTheme.typography.labelLarge,
                         color = MaterialTheme.colorScheme.primary
                     )
@@ -871,9 +1212,90 @@ private fun DownloadModeOption(
 }
 
 @Composable
+private fun ExportDialog(
+    outputModes: Set<LyricsOutputMode>,
+    onToggleMode: (LyricsOutputMode) -> Unit,
+    onExport: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+        tonalElevation = 0.dp,
+        title = {
+            Text(
+                "EXPORT ALL LYRICS TO TRACKS' DIRECTORY:",
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                ExportOption(
+                    label = "Plain lyrics (.txt)",
+                    checked = outputModes.contains(LyricsOutputMode.PlainTextFile),
+                    onCheckedChange = { onToggleMode(LyricsOutputMode.PlainTextFile) }
+                )
+                ExportOption(
+                    label = "Synced lyrics (.lrc)",
+                    checked = outputModes.contains(LyricsOutputMode.LrcFile),
+                    onCheckedChange = { onToggleMode(LyricsOutputMode.LrcFile) }
+                )
+                ExportOption(
+                    label = "Embed into track",
+                    checked = outputModes.contains(LyricsOutputMode.EmbeddedSynced),
+                    onCheckedChange = { onToggleMode(LyricsOutputMode.EmbeddedSynced) }
+                )
+                
+                Spacer(modifier = Modifier.height(16.dp))
+                
+                Button(
+                    onClick = onExport,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = MaterialTheme.shapes.medium,
+                    enabled = outputModes.isNotEmpty()
+                ) {
+                    Text("EXPORT", fontWeight = FontWeight.Bold)
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = {}
+    )
+}
+
+@Composable
+private fun ExportOption(
+    label: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onCheckedChange(!checked) }
+            .padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Checkbox(
+            checked = checked,
+            onCheckedChange = onCheckedChange
+        )
+        Text(
+            text = label,
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.Bold
+        )
+    }
+}
+
+@Composable
 private fun LyricsPreviewDialog(
     track: TrackItem?,
     results: List<LyricsLookupResult>,
+    isBusy: Boolean,
     onSearch: (String, String, String) -> Unit,
     onSave: (LyricsLookupResult) -> Unit,
     onDismiss: () -> Unit
@@ -955,8 +1377,7 @@ private fun LyricsPreviewDialog(
                         Button(
                             onClick = { onSearch(title, artist, album) },
                             enabled = title.isNotBlank(),
-                            modifier = Modifier.align(Alignment.CenterHorizontally),
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFE91E63))
+                            modifier = Modifier.align(Alignment.CenterHorizontally)
                         ) {
                             Text("SEARCH")
                         }
@@ -981,6 +1402,15 @@ private fun LyricsPreviewDialog(
                             fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace
                         )
                     }
+                } else if (isBusy) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(200.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        CircularProgressIndicator()
+                    }
                 } else {
                     Column(
                         modifier = Modifier.fillMaxWidth(),
@@ -1000,15 +1430,15 @@ private fun LyricsPreviewDialog(
                                     .fillMaxWidth(),
                                 verticalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
-                                items(
+                                itemsIndexed(
                                     items = results,
-                                    key = { it.lyrics.hashCode() },
-                                    contentType = { "lyrics_result" }
-                                ) { result ->
+                                    key = { index, result -> "${result.trackName}-${result.lyrics.hashCode()}-$index" },
+                                    contentType = { _, _ -> "lyrics_result" }
+                                ) { _, result ->
                                     LyricsResultCard(
                                         result = result,
-                                        onPreview = { selectedResultForPreview = it },
-                                        onSave = { onSave(it) }
+                                        onPreview = { selectedResultForPreview = result },
+                                        onSave = { onSave(result) }
                                     )
                                 }
                             }
@@ -1078,8 +1508,18 @@ private fun LyricsResultCard(
                         Text("$lineCount Lines", modifier = Modifier.padding(horizontal = 4.dp))
                     }
                     
-                    if (result.isSynced) {
-                        Badge(containerColor = Color(0xFFE91E63), contentColor = Color.White) {
+                    if (result.isInstrumental) {
+                        Badge(
+                            containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                            contentColor = MaterialTheme.colorScheme.onSurfaceVariant
+                        ) {
+                            Text("Instrumental", modifier = Modifier.padding(horizontal = 4.dp))
+                        }
+                    } else if (result.isSynced) {
+                        Badge(
+                            containerColor = MaterialTheme.colorScheme.primaryContainer,
+                            contentColor = MaterialTheme.colorScheme.onPrimaryContainer
+                        ) {
                             Text("Synced", modifier = Modifier.padding(horizontal = 4.dp))
                         }
                     }
@@ -1106,26 +1546,27 @@ private fun LyricsResultCard(
 }
 
 
-@Composable
 private fun LyricsStatus.color() = when (this) {
-    LyricsStatus.Found, LyricsStatus.Saved -> MaterialTheme.colorScheme.primary
-    LyricsStatus.Missing, LyricsStatus.Failed -> MaterialTheme.colorScheme.error
-    LyricsStatus.Skipped -> MaterialTheme.colorScheme.tertiary
-    else -> MaterialTheme.colorScheme.onSurfaceVariant
+    LyricsStatus.Found, LyricsStatus.Saved -> Color(0xFF2E7D32) // Green
+    LyricsStatus.Missing, LyricsStatus.Failed -> Color(0xFFC62828) // Red
+    LyricsStatus.Skipped -> Color(0xFF757575) // Gray
+    else -> Color(0xFF757575)
 }
 
-private fun LyricsStatus.label() = when (this) {
-    LyricsStatus.Ready -> "Not checked"
-    LyricsStatus.Found -> "Lyrics found"
+private fun LyricsStatus.label(track: TrackItem? = null): String = when (this) {
+    LyricsStatus.Ready -> track?.message?.takeIf { it.isNotBlank() } ?: "Not checked"
+    LyricsStatus.Found -> track?.message?.takeIf { it.isNotBlank() } ?: "Lyrics found"
     LyricsStatus.Downloading -> "Searching"
-    LyricsStatus.Saved -> "Lyrics found"
+    LyricsStatus.Saved -> track?.message?.takeIf { it.isNotBlank() } ?: "Lyrics found"
     LyricsStatus.Missing -> "No lyrics"
+    LyricsStatus.Skipped -> track?.message?.takeIf { it.isNotBlank() } ?: "Skipped"
+    LyricsStatus.Failed -> track?.message?.takeIf { it.isNotBlank() } ?: "Failed"
     else -> name
 }
 
 private fun requestBatteryOptimizationExemption(context: android.content.Context) {
     val powerManager = context.getSystemService(PowerManager::class.java)
-    if (powerManager.isIgnoringBatteryOptimizations(context.packageName)) return
+    if (powerManager?.isIgnoringBatteryOptimizations(context.packageName) == true) return
 
     runCatching {
         context.startActivity(

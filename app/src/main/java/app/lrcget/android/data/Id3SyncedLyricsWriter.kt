@@ -7,14 +7,15 @@ import java.nio.ByteOrder
 object Id3SyncedLyricsWriter {
     fun writeSyncedLyrics(mp3Bytes: ByteArray, lrcText: String): ByteArray {
         val lines = parseLrc(lrcText)
-        require(lines.isNotEmpty()) { "No timestamped lyrics to embed" }
-
         val existing = readExistingTag(mp3Bytes)
         val audioStart = existing?.endOffset ?: 0
         val version = existing?.majorVersion?.takeIf { it == 3 || it == 4 } ?: 3
         val keptFrames = existing?.framesWithoutSyncedLyrics() ?: byteArrayOf()
-        val syncedLyricsFrame = buildSyncedLyricsFrame(lines, version)
-        val tagBody = keptFrames + syncedLyricsFrame
+        
+        val syncedLyricsFrame = if (lines.isNotEmpty()) buildSyncedLyricsFrame(lines, version) else byteArrayOf()
+        val plainLyricsFrame = buildUnsyncedLyricsFrame(lrcText, version)
+
+        val tagBody = keptFrames + syncedLyricsFrame + plainLyricsFrame
         val header = byteArrayOf(
             'I'.code.toByte(),
             'D'.code.toByte(),
@@ -68,22 +69,37 @@ object Id3SyncedLyricsWriter {
 
     private fun buildSyncedLyricsFrame(lines: List<SyncedLine>, version: Int): ByteArray {
         val payload = ByteArrayOutputStream()
-        payload.write(1)
+        payload.write(0) // Encoding: 0 = ISO-8859-1 (Most compatible for SYLT)
         payload.write("eng".toByteArray(Charsets.ISO_8859_1))
-        payload.write(2)
-        payload.write(1)
-        payload.write(byteArrayOf((-1).toByte(), (-2).toByte(), 0, 0))
+        payload.write(2) // Timestamp format: 2 = milliseconds
+        payload.write(1) // Content type: 1 = lyrics
+        payload.write(0) // Terminate empty description
 
         lines.forEach { line ->
-            payload.write(byteArrayOf((-1).toByte(), (-2).toByte()))
-            payload.write(line.text.toByteArray(Charsets.UTF_16LE))
-            payload.write(byteArrayOf(0, 0))
+            // Use ISO-8859-1 for the lyrics text in SYLT
+            payload.write(line.text.toByteArray(Charsets.ISO_8859_1))
+            payload.write(0) // Null terminator
             payload.write(ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(line.timeMs).array())
         }
 
         val payloadBytes = payload.toByteArray()
         val sizeBytes = if (version == 4) syncSafe(payloadBytes.size) else intBytes(payloadBytes.size)
         return "SYLT".toByteArray(Charsets.ISO_8859_1) + sizeBytes + byteArrayOf(0, 0) + payloadBytes
+    }
+
+    private fun buildUnsyncedLyricsFrame(lrcText: String, version: Int): ByteArray {
+        // Keep timestamps in USLT for maximum compatibility with Android players
+        val payload = ByteArrayOutputStream()
+        payload.write(1) // UTF-16
+        payload.write("eng".toByteArray(Charsets.ISO_8859_1))
+        payload.write(byteArrayOf((-1).toByte(), (-2).toByte(), 0, 0)) // Empty description
+        payload.write(byteArrayOf((-1).toByte(), (-2).toByte())) // BOM
+        payload.write(lrcText.toByteArray(Charsets.UTF_16LE))
+        payload.write(byteArrayOf(0, 0)) // Termination
+
+        val payloadBytes = payload.toByteArray()
+        val sizeBytes = if (version == 4) syncSafe(payloadBytes.size) else intBytes(payloadBytes.size)
+        return "USLT".toByteArray(Charsets.ISO_8859_1) + sizeBytes + byteArrayOf(0, 0) + payloadBytes
     }
 
     private fun parseLrc(lrcText: String): List<SyncedLine> {
@@ -132,6 +148,9 @@ object Id3SyncedLyricsWriter {
 
     private fun intBytes(size: Int): ByteArray =
         ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(size).array()
+
+    private fun List<SyncedLine>.toPlainLyrics(): String =
+        joinToString("\n") { it.text }
 
     private data class ExistingTag(
         val majorVersion: Int,
