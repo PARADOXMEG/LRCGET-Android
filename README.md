@@ -6,7 +6,7 @@ This project brings the core workflow of the desktop version of LRCGET to Androi
 
 # Features
 
-## Core Workflow
+## workflow
 
 - Choose a music folder using Android Storage Access Framework
 - Recursively scan music libraries
