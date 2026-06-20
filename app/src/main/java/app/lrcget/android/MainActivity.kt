@@ -2477,11 +2477,22 @@ private fun ShareLyricsDialog(
     val graphicsLayer = rememberGraphicsLayer()
     val coroutineScope = rememberCoroutineScope()
 
-    var backgroundColor by remember { mutableStateOf(Color(0xFF1E1E24)) }
-    var paletteColors by remember { mutableStateOf<List<Color>>(emptyList()) }
+    val colorScheme = MaterialTheme.colorScheme
+    val monetColors = remember(colorScheme) {
+        listOf(
+            colorScheme.primaryContainer,
+            colorScheme.secondaryContainer,
+            colorScheme.tertiaryContainer,
+            colorScheme.surfaceContainerHigh
+        ).distinct()
+    }
+    val initialColor = monetColors.first()
+    var backgroundColor by remember(initialColor) { mutableStateOf(initialColor) }
+    var paletteColors by remember(monetColors) { mutableStateOf(monetColors) }
     val imageLoader = SingletonImageLoader.get(context)
 
-    LaunchedEffect(track.artUri) {
+    LaunchedEffect(track.artUri, monetColors) {
+        paletteColors = monetColors
         if (track.artUri != null) {
             val request = ImageRequest.Builder(context)
                 .data(track.artUri)
@@ -2501,10 +2512,7 @@ private fun ShareLyricsDialog(
                         palette.darkVibrantSwatch?.let { Color(it.rgb) },
                         palette.darkMutedSwatch?.let { Color(it.rgb) }
                     ).distinct()
-                    paletteColors = colors
-                    if (colors.isNotEmpty()) {
-                        backgroundColor = colors.first()
-                    }
+                    paletteColors = (monetColors + colors).distinct()
                 }
             }
         }
