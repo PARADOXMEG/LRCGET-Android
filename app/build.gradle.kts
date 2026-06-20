@@ -40,6 +40,10 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
     implementation("net.jthink:jaudiotagger:3.0.1")
+    implementation("io.coil-kt.coil3:coil-compose:3.0.4")
+    implementation("io.coil-kt.coil3:coil-network-okhttp:3.0.4")
+    implementation("io.coil-kt.coil3:coil-android:3.0.4")
+    implementation("androidx.palette:palette-ktx:1.0.0")
 
     debugImplementation("androidx.compose.ui:ui-tooling:1.7.5")
 }

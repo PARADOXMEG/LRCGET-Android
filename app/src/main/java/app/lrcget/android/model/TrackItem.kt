@@ -45,6 +45,7 @@ data class TrackItem(
     val durationSeconds: Int,
     val lrcFileName: String,
     val subtitle: String = "",
+    val artUri: String? = null,
     val hasLyrics: Boolean = false,
     val hasSyncedLyrics: Boolean = false,
     val isInstrumental: Boolean = false,

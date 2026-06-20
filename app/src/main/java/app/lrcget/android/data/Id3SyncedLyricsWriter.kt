@@ -13,7 +13,7 @@ object Id3SyncedLyricsWriter {
         val keptFrames = existing?.framesWithoutSyncedLyrics() ?: byteArrayOf()
         
         val syncedLyricsFrame = if (lines.isNotEmpty()) buildSyncedLyricsFrame(lines, version) else byteArrayOf()
-        val plainLyricsFrame = buildUnsyncedLyricsFrame(lrcText, version)
+        val plainLyricsFrame = if (lrcText.isNotEmpty()) buildUnsyncedLyricsFrame(lrcText, version) else byteArrayOf()
 
         val tagBody = keptFrames + syncedLyricsFrame + plainLyricsFrame
         val header = byteArrayOf(

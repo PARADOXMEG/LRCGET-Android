@@ -8,8 +8,7 @@ import android.provider.DocumentsContract
 import app.lrcget.android.model.LyricsOutputMode
 import app.lrcget.android.model.LyricsStatus
 import app.lrcget.android.model.TrackItem
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.*
 import org.jaudiotagger.audio.AudioFileIO
 import org.jaudiotagger.tag.FieldKey
 import java.io.File
@@ -23,8 +22,13 @@ class MusicLibraryRepository(private val context: Context) {
     private val lrclibClient = LrclibClient()
     private val parentFolders = mutableMapOf<String, ParentDirectory>()
 
+    init {
+        // Enable Android-specific fixes for jaudiotagger
+        org.jaudiotagger.tag.TagOptionSingleton.getInstance().isAndroid = true
+    }
+
     suspend fun scan(rootUri: Uri, onProgress: (Int, Int) -> Unit = { _, _ -> }): List<TrackItem> = withContext(Dispatchers.IO) {
-        val tracks = mutableListOf<TrackItem>()
+        clearInternalCache()
         parentFolders.clear()
 
         val rootId = DocumentsContract.getTreeDocumentId(rootUri)
@@ -94,9 +98,22 @@ class MusicLibraryRepository(private val context: Context) {
         val totalCount = foundFiles.size
         if (totalCount == 0) return@withContext emptyList()
 
-        foundFiles.forEachIndexed { index, file ->
-            tracks.add(toTrack(file))
-            onProgress(index + 1, totalCount)
+        // Parallel processing of metadata
+        // Reduced parallelism to avoid disk I/O congestion which causes lag
+        val parallelism = 3
+        val processedCount = java.util.concurrent.atomic.AtomicInteger(0)
+        
+        val tracks = coroutineScope {
+            foundFiles.chunked((totalCount / parallelism).coerceAtLeast(1)).map { chunk ->
+                async {
+                    chunk.map { file ->
+                        val track = toTrack(file)
+                        val current = processedCount.incrementAndGet()
+                        onProgress(current, totalCount)
+                        track
+                    }
+                }
+            }.awaitAll().flatten()
         }
 
         val collator = Collator.getInstance(Locale.getDefault()).apply {
@@ -120,7 +137,7 @@ class MusicLibraryRepository(private val context: Context) {
         val uri = file.uri
         val fileName = file.fileName
         val baseName = fileName.substringBeforeLast('.', fileName)
-        val metadata = readMetadata(uri, fileName)
+        val metadata = readMetadata(uri, fileName, file.hasLrcFile)
         val title = metadata.title.readableOrBlank().ifBlank { baseName.cleanTitle() }
         val id = uri.toString()
 
@@ -144,6 +161,17 @@ class MusicLibraryRepository(private val context: Context) {
             else -> ""
         }
 
+        // Save artwork to cache
+        val artFile = File(context.cacheDir, "art_${id.hashCode()}.jpg")
+        val artPath = if (artFile.exists()) {
+            artFile.absolutePath
+        } else if (metadata.artwork != null) {
+            runCatching {
+                artFile.outputStream().use { it.write(metadata.artwork) }
+                artFile.absolutePath
+            }.getOrNull()
+        } else null
+
         return TrackItem(
             id = id,
             audioUri = uri,
@@ -155,6 +183,7 @@ class MusicLibraryRepository(private val context: Context) {
             durationSeconds = metadata.durationSeconds,
             lrcFileName = "$baseName.lrc",
             subtitle = subtitle,
+            artUri = artPath,
             hasLyrics = hasAnyLyrics,
             hasSyncedLyrics = hasSynced,
             isInstrumental = false,
@@ -181,7 +210,7 @@ class MusicLibraryRepository(private val context: Context) {
             val result = when (mode) {
                 LyricsOutputMode.LrcFile -> saveLyricsToFile(lastResult, parent, lyrics.lyrics, ".lrc", overwriteExisting)
                 LyricsOutputMode.PlainTextFile -> saveLyricsToFile(lastResult, parent, stripTimestamps(lyrics.lyrics), ".txt", overwriteExisting)
-                LyricsOutputMode.EmbeddedSynced -> embedLyrics(lastResult, lyrics.lyrics)
+                LyricsOutputMode.EmbeddedSynced -> embedLyrics(lastResult, lyrics.lyrics, parent)
             }
             
             lastResult = if (result.status == LyricsStatus.Saved) {
@@ -222,7 +251,25 @@ class MusicLibraryRepository(private val context: Context) {
 
 
     suspend fun getLyricsResultForTrack(track: TrackItem): LyricsLookupResult? = withContext(Dispatchers.IO) {
-        lrclibClient.findLyrics(track, syncedOnly = false)
+        val firstAttempt = lrclibClient.findLyrics(track, syncedOnly = false)
+        if (firstAttempt != null) return@withContext firstAttempt
+
+        // Smart Fallback: Clean title and retry
+        val cleanTitle = track.title.stripExtraInfo()
+        if (cleanTitle != track.title) {
+            val retryTrack = track.copy(title = cleanTitle)
+            return@withContext lrclibClient.findLyrics(retryTrack, syncedOnly = false)
+        }
+        
+        null
+    }
+
+    private fun String.stripExtraInfo(): String {
+        return this.replace(Regex("\\s*\\(.*?\\)", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("\\s*\\[.*?]", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("\\s*-\\s*(Remaster|Radio Edit|Live|Deluxe|Bonus).*$", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("\\s*feat\\..*$", RegexOption.IGNORE_CASE), "")
+            .trim()
     }
 
     suspend fun getAllLyricsForPreview(track: TrackItem): List<LyricsLookupResult> = withContext(Dispatchers.IO) {
@@ -255,7 +302,7 @@ class MusicLibraryRepository(private val context: Context) {
             val result = when (mode) {
                 LyricsOutputMode.LrcFile -> saveLyricsToFile(lastResult, parent, lyrics.lyrics, ".lrc", overwriteExisting)
                 LyricsOutputMode.PlainTextFile -> saveLyricsToFile(lastResult, parent, stripTimestamps(lyrics.lyrics), ".txt", overwriteExisting)
-                LyricsOutputMode.EmbeddedSynced -> embedLyrics(lastResult, lyrics.lyrics)
+                LyricsOutputMode.EmbeddedSynced -> embedLyrics(lastResult, lyrics.lyrics, parent)
             }
             
             if (result.status == LyricsStatus.Saved) {
@@ -296,35 +343,55 @@ class MusicLibraryRepository(private val context: Context) {
         
         // 2. Clear embedded lyrics
         var clearedEmbedded = false
-        val extension = track.fileName.substringAfterLast('.', "").lowercase()
-        if (extension in setOf("mp3", "flac", "m4a", "ogg", "opus", "wav", "aac", "wma")) {
-            val tempFile = File(context.cacheDir, "temp_delete_${System.currentTimeMillis()}.$extension")
+        val rawExtension = track.fileName.substringAfterLast('.', "").lowercase()
+        if (rawExtension in setOf("mp3", "flac", "m4a", "ogg", "opus", "wav", "aac", "wma")) {
+            val tempFile = File(context.cacheDir, "temp_delete_${System.currentTimeMillis()}.$rawExtension")
             val embedResult = runCatching {
                 resolver.openInputStream(track.audioUri)?.use { input ->
                     tempFile.outputStream().use { output -> input.copyTo(output) }
                 } ?: error("Could not read file")
 
-                if (track.fileName.endsWith(".mp3", ignoreCase = true)) {
-                    val bytes = tempFile.readBytes()
-                    // Re-use Id3SyncedLyricsWriter to rebuild tag without SYLT/USLT
-                    val updatedBytes = Id3SyncedLyricsWriter.writeSyncedLyrics(bytes, "") 
-                    tempFile.writeBytes(updatedBytes)
+                val effectiveExtension = when {
+                    rawExtension == "ogg" || rawExtension == "opus" -> identifyOggBitstream(tempFile) ?: rawExtension
+                    rawExtension == "aac" -> "m4a"
+                    else -> rawExtension
+                }
+
+                val fileToTag = if (effectiveExtension != rawExtension) {
+                    val renamedFile = File(context.cacheDir, "temp_delete_fixed_${System.currentTimeMillis()}.$effectiveExtension")
+                    if (tempFile.renameTo(renamedFile)) renamedFile else tempFile
                 } else {
-                    val audioFile = AudioFileIO.read(tempFile)
-                    val tag = audioFile.tag
-                    if (tag != null) {
-                        tag.deleteField(FieldKey.LYRICS)
-                        audioFile.commit()
+                    tempFile
+                }
+
+                when (effectiveExtension) {
+                    "mp3" -> {
+                        val bytes = fileToTag.readBytes()
+                        val updatedBytes = Id3SyncedLyricsWriter.writeSyncedLyrics(bytes, "")
+                        fileToTag.writeBytes(updatedBytes)
+                    }
+                    else -> {
+                        val audioFile = AudioFileIO.read(fileToTag)
+                        val tag = audioFile.tag
+                        if (tag != null) {
+                            tag.deleteField(FieldKey.LYRICS)
+                            audioFile.commit()
+                        }
                     }
                 }
 
                 resolver.openOutputStream(track.audioUri, "wt")?.use { output ->
-                    tempFile.inputStream().use { input -> input.copyTo(output) }
+                    fileToTag.inputStream().use { input -> input.copyTo(output) }
                 } ?: error("Could not write file")
+                
+                if (fileToTag.exists()) fileToTag.delete()
+                if (tempFile.exists()) tempFile.delete()
                 true
-            }.getOrDefault(false)
+            }.getOrElse { e ->
+                if (tempFile.exists()) tempFile.delete()
+                false
+            }
             clearedEmbedded = embedResult
-            if (tempFile.exists()) tempFile.delete()
         }
 
         val messages = mutableListOf<String>()
@@ -338,6 +405,17 @@ class MusicLibraryRepository(private val context: Context) {
             hasLyrics = false,
             hasSyncedLyrics = false
         )
+    }
+
+    fun clearInternalCache() {
+        runCatching {
+            context.cacheDir.listFiles()?.forEach { file ->
+                if (file.name.startsWith("temp_") || 
+                    (file.name.startsWith("art_") && System.currentTimeMillis() - file.lastModified() > 86400000)) {
+                    file.delete()
+                }
+            }
+        }
     }
 
     private fun saveLyricsToFile(
@@ -381,35 +459,61 @@ class MusicLibraryRepository(private val context: Context) {
         }.trim()
     }
 
-    private fun embedLyrics(track: TrackItem, lyrics: String): TrackItem {
-        val extension = track.fileName.substringAfterLast('.', "").takeIf { it.isNotBlank() } ?: "audio"
-        val tempFile = File(context.cacheDir, "temp_tagging_${System.currentTimeMillis()}.$extension")
+    private fun embedLyrics(track: TrackItem, lyrics: String, parent: ParentDirectory? = null): TrackItem {
+        val rawExtension = track.fileName.substringAfterLast('.', "").lowercase()
+        val tempFile = File(context.cacheDir, "temp_tagging_${System.currentTimeMillis()}.$rawExtension")
+        
         return runCatching {
-            // Copy from Uri to temp file
+            // 1. Copy to temp file
             resolver.openInputStream(track.audioUri)?.use { input ->
-                FileOutputStream(tempFile).use { output ->
-                    input.copyTo(output)
-                }
+                FileOutputStream(tempFile).use { output -> input.copyTo(output) }
             } ?: error("Read error")
 
-            val isSynced = lyrics.hasLrcTimestamps()
-            if (track.fileName.endsWith(".mp3", ignoreCase = true)) {
-                val updatedBytes = Id3SyncedLyricsWriter.writeSyncedLyrics(tempFile.readBytes(), lyrics)
-                tempFile.writeBytes(updatedBytes)
-            } else {
-                val audioFile = AudioFileIO.read(tempFile)
-                val tag = audioFile.tag ?: audioFile.createDefaultTag()
-                tag.setField(FieldKey.LYRICS, lyrics)
-                audioFile.tag = tag
-                audioFile.commit()
+            // 2. Identify correct reader extension for Ogg containers
+            val effectiveExtension = when {
+                rawExtension == "ogg" || rawExtension == "opus" -> identifyOggBitstream(tempFile) ?: rawExtension
+                rawExtension == "aac" -> "m4a"
+                else -> rawExtension
             }
 
-            // Copy back to Uri
-            resolver.openOutputStream(track.audioUri, "wt")?.use { output ->
-                tempFile.inputStream().use { input ->
-                    input.copyTo(output)
+            // Automatic Fallback: If it's an Opus audio file, save an external LRC instead of embedding
+            if (effectiveExtension == "opus" && parent != null) {
+                if (tempFile.exists()) tempFile.delete()
+                return saveLyricsToFile(track, parent, lyrics, ".lrc", true)
+            }
+
+            // 3. Rename temp file if extension needs adjustment for jaudiotagger
+            val fileToTag = if (effectiveExtension != rawExtension) {
+                val renamedFile = File(context.cacheDir, "temp_tagging_fixed_${System.currentTimeMillis()}.$effectiveExtension")
+                tempFile.renameTo(renamedFile)
+                renamedFile
+            } else {
+                tempFile
+            }
+
+            val isSynced = lyrics.hasLrcTimestamps()
+            when (effectiveExtension) {
+                "mp3" -> {
+                    val updatedBytes = Id3SyncedLyricsWriter.writeSyncedLyrics(fileToTag.readBytes(), lyrics)
+                    fileToTag.writeBytes(updatedBytes)
                 }
+                else -> {
+                    // jaudiotagger handles Ogg (Vorbis), FLAC, MP4 (M4A), WAV, WMA
+                    val audioFile = AudioFileIO.read(fileToTag)
+                    val tag = audioFile.tag ?: audioFile.createDefaultTag()
+                    tag.setField(FieldKey.LYRICS, lyrics)
+                    audioFile.tag = tag
+                    audioFile.commit()
+                }
+            }
+
+            // 4. Write back to original location
+            resolver.openOutputStream(track.audioUri, "wt")?.use { output ->
+                fileToTag.inputStream().use { input -> input.copyTo(output) }
             } ?: error("Write error")
+
+            if (fileToTag.exists()) fileToTag.delete()
+            if (tempFile.exists()) tempFile.delete()
 
             track.copy(
                 status = LyricsStatus.Saved,
@@ -417,14 +521,36 @@ class MusicLibraryRepository(private val context: Context) {
                 hasLyrics = true,
                 hasSyncedLyrics = isSynced
             )
-        }.getOrElse {
-            track.copy(status = LyricsStatus.Failed, message = "Embed fail: ${it.message}")
-        }.also {
+        }.getOrElse { e ->
             if (tempFile.exists()) tempFile.delete()
+            val msg = e.message ?: ""
+            val userMsg = when {
+                msg.contains("No Reader", ignoreCase = true) -> "Format not supported for embedding"
+                msg.contains("Invalid Identification", ignoreCase = true) -> "Header mismatch in ${rawExtension.uppercase()} file"
+                else -> "Embed fail: $msg"
+            }
+            track.copy(status = LyricsStatus.Failed, message = userMsg)
         }
     }
 
-    private fun readMetadata(uri: Uri, fileName: String? = null): AudioMetadata {
+    private fun identifyOggBitstream(file: File): String? {
+        return try {
+            file.inputStream().use { input ->
+                val header = ByteArray(64)
+                if (input.read(header) < 64) return null
+                val content = String(header, Charsets.ISO_8859_1)
+                when {
+                    content.contains("OpusHead") -> "opus"
+                    content.contains("vorbis") -> "ogg"
+                    else -> null
+                }
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun readMetadata(uri: Uri, fileName: String? = null, skipDeepScan: Boolean = false): AudioMetadata {
         val retriever = MediaMetadataRetriever()
         var metadata = AudioMetadata()
         
@@ -444,28 +570,46 @@ class MusicLibraryRepository(private val context: Context) {
                         ?.toLongOrNull()
                         ?.div(1000)
                         ?.toInt()
-                        ?: 0
+                        ?: 0,
+                    artwork = retriever.embeddedPicture
                 )
             }
         }
         retriever.release()
 
         // Use jaudiotagger for more precise metadata and lyrics detection
-        val extension = fileName?.substringAfterLast('.', "")?.lowercase() 
+        val rawExtension = fileName?.substringAfterLast('.', "")?.lowercase() 
             ?: uri.toString().substringAfterLast('.', "").lowercase()
 
-        if (extension in setOf("mp3", "flac", "m4a", "ogg", "opus", "wav", "aac", "wma")) {
-            val tempFile = File(context.cacheDir, "temp_meta_${System.currentTimeMillis()}.$extension")
+        if (!skipDeepScan && rawExtension in setOf("mp3", "flac", "m4a", "ogg", "opus", "wav", "aac", "wma")) {
+            val tempFile = File(context.cacheDir, "temp_meta_${System.currentTimeMillis()}.$rawExtension")
             runCatching {
                 resolver.openInputStream(uri)?.use { input ->
                     tempFile.outputStream().use { output -> input.copyTo(output) }
                 }
-                val audioFile = AudioFileIO.read(tempFile)
+                
+                val effectiveExtension = if (rawExtension == "ogg" || rawExtension == "opus") {
+                    identifyOggBitstream(tempFile) ?: rawExtension
+                } else if (rawExtension == "aac") {
+                    "m4a"
+                } else {
+                    rawExtension
+                }
+
+                val fileToRead = if (effectiveExtension != rawExtension) {
+                    val renamedFile = File(context.cacheDir, "temp_meta_fixed_${System.currentTimeMillis()}.$effectiveExtension")
+                    tempFile.renameTo(renamedFile)
+                    renamedFile
+                } else {
+                    tempFile
+                }
+
+                val audioFile = AudioFileIO.read(fileToRead)
                 val tag = audioFile.tag
                 if (tag != null) {
                     val lyrics = tag.getFirst(FieldKey.LYRICS)
                     val hasSynced = lyrics.hasLrcTimestamps()
-                    
+
                     val tagTitle = tag.getFirst(FieldKey.TITLE).readableOrBlank()
                     val tagArtist = tag.getFirst(FieldKey.ARTIST).readableOrBlank()
                     val tagAlbum = tag.getFirst(FieldKey.ALBUM).readableOrBlank()
@@ -475,9 +619,11 @@ class MusicLibraryRepository(private val context: Context) {
                         artist = tagArtist.ifBlank { metadata.artist },
                         album = tagAlbum.ifBlank { metadata.album },
                         hasEmbeddedLyrics = lyrics.isNotBlank(),
-                        hasSyncedEmbeddedLyrics = hasSynced
+                        hasSyncedEmbeddedLyrics = hasSynced,
+                        artwork = metadata.artwork ?: tag.firstArtwork?.binaryData
                     )
                 }
+                if (fileToRead.exists()) fileToRead.delete()
             }
             if (tempFile.exists()) tempFile.delete()
         }
@@ -556,7 +702,7 @@ class MusicLibraryRepository(private val context: Context) {
     }
 
     private fun lyricsMimeType(extension: String): String =
-        if (extension.equals(".txt", ignoreCase = true) || extension.equals(".lrc", ignoreCase = true)) {
+        if (extension.equals(".txt", ignoreCase = true)) {
             "text/plain"
         } else {
             "application/octet-stream"
@@ -581,6 +727,34 @@ class MusicLibraryRepository(private val context: Context) {
         val album: String = "",
         val durationSeconds: Int = 0,
         val hasEmbeddedLyrics: Boolean = false,
-        val hasSyncedEmbeddedLyrics: Boolean = false
-    )
+        val hasSyncedEmbeddedLyrics: Boolean = false,
+        val artwork: ByteArray? = null
+    ) {
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (other !is AudioMetadata) return false
+            if (title != other.title) return false
+            if (artist != other.artist) return false
+            if (album != other.album) return false
+            if (durationSeconds != other.durationSeconds) return false
+            if (hasEmbeddedLyrics != other.hasEmbeddedLyrics) return false
+            if (hasSyncedEmbeddedLyrics != other.hasSyncedEmbeddedLyrics) return false
+            if (artwork != null) {
+                if (other.artwork == null) return false
+                if (!artwork.contentEquals(other.artwork)) return false
+            } else if (other.artwork != null) return false
+            return true
+        }
+
+        override fun hashCode(): Int {
+            var result = title.hashCode()
+            result = 31 * result + artist.hashCode()
+            result = 31 * result + album.hashCode()
+            result = 31 * result + durationSeconds
+            result = 31 * result + hasEmbeddedLyrics.hashCode()
+            result = 31 * result + hasSyncedEmbeddedLyrics.hashCode()
+            result = 31 * result + (artwork?.contentHashCode() ?: 0)
+            return result
+        }
+    }
 }

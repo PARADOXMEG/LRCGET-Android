@@ -16,7 +16,8 @@ data class LyricsLookupResult(
     val trackName: String = "",
     val artistName: String = "",
     val albumName: String = "",
-    val duration: Int = 0
+    val duration: Int = 0,
+    val albumArtUrl: String? = null
 ) {
     val lineCount: Int by lazy { lyrics.lines().count { it.isNotBlank() } }
 }
@@ -129,7 +130,8 @@ class LrclibClient {
             trackName = optString("trackName"),
             artistName = optString("artistName"),
             albumName = optString("albumName"),
-            duration = optInt("duration")
+            duration = optInt("duration"),
+            albumArtUrl = optString("albumArtUrl").takeIf { it.isNotBlank() && it != "null" }
         )
     }
 

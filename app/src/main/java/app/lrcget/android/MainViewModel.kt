@@ -6,6 +6,10 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Application
 import android.content.Intent
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
+import android.media.MediaPlayer
 import android.net.Uri
 import androidx.compose.runtime.Stable
 import androidx.core.content.edit
@@ -23,6 +27,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -56,7 +61,24 @@ data class MainUiState(
     val notFoundCount: Int = 0,
     val fetchedLyrics: Map<String, LyricsLookupResult> = emptyMap(),
     val selectedTrackIds: Set<String> = emptySet(),
+    val searchQuery: String = "",
+    val filterStatus: LyricsStatus? = null,
+    val isPlaying: Boolean = false,
+    val playingTrackId: String? = null,
+    val playbackPositionMs: Int = 0,
+    val processingTrackId: String? = null,
+    val isRestoring: Boolean = true,
 ) {
+    val filteredTracks: List<TrackItem>
+        get() = tracks.filter { track ->
+            val matchesQuery = searchQuery.isBlank() || 
+                track.title.contains(searchQuery, ignoreCase = true) || 
+                track.artist.contains(searchQuery, ignoreCase = true) ||
+                track.album.contains(searchQuery, ignoreCase = true)
+            val matchesFilter = filterStatus == null || track.status == filterStatus
+            matchesQuery && matchesFilter
+        }
+
     val savedCount: Int get() = tracks.count { it.status == LyricsStatus.Saved }
     val missingCount: Int get() = tracks.count { it.status == LyricsStatus.Missing }
 }
@@ -69,11 +91,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val state: StateFlow<MainUiState> = _state
     private var downloadJob: kotlinx.coroutines.Job? = null
     private var scanJob: kotlinx.coroutines.Job? = null
+    private var mediaPlayer: MediaPlayer? = null
+    private var playbackJob: kotlinx.coroutines.Job? = null
+    
+    private val audioManager = application.getSystemService(Application.AUDIO_SERVICE) as AudioManager
+    private var audioFocusRequest: AudioFocusRequest? = null
+    private val audioFocusChangeListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
+        if (focusChange == AudioManager.AUDIOFOCUS_LOSS || 
+            focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT || 
+            focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK) {
+            pauseAudio()
+        }
+    }
 
     init {
         createNotificationChannel()
         restoreSettings()
-        restoreLibrary()
+        viewModelScope.launch {
+            restoreLibrary()
+        }
     }
 
     private fun restoreSettings() {
@@ -97,8 +133,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         ) }
     }
 
-    private fun restoreLibrary() {
-        val uriString = prefs.getString("library_uri", null) ?: return
+    private suspend fun restoreLibrary() {
+        val uriString = prefs.getString("library_uri", null)
+        if (uriString == null) {
+            _state.update { it.copy(isRestoring = false) }
+            return
+        }
         val uri = uriString.toUri()
         
         // Check if we still have permission
@@ -107,15 +147,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         if (hasPermission) {
-            val cachedTracks = loadTracks()
+            val cachedTracks = withContext(kotlinx.coroutines.Dispatchers.IO) { loadTracks() }
             if (cachedTracks.isNotEmpty()) {
                 repository.restoreParentFolders(uri, cachedTracks)
             }
             _state.update { it.copy(
                 libraryUri = uri, 
                 tracks = cachedTracks,
+                isRestoring = false,
                 message = if (cachedTracks.isNotEmpty()) "Library restored (${cachedTracks.size} tracks)" else "Library folder restored"
             ) }
+        } else {
+            _state.update { it.copy(isRestoring = false) }
         }
     }
 
@@ -135,6 +178,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         put("durationSeconds", track.durationSeconds)
                         put("lrcFileName", track.lrcFileName)
                         put("subtitle", track.subtitle)
+                        put("artUri", track.artUri)
                         put("hasLyrics", track.hasLyrics)
                         put("hasSyncedLyrics", track.hasSyncedLyrics)
                         put("isInstrumental", track.isInstrumental)
@@ -170,6 +214,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     durationSeconds = obj.getInt("durationSeconds"),
                     lrcFileName = obj.getString("lrcFileName"),
                     subtitle = obj.optString("subtitle", ""),
+                    artUri = obj.optString("artUri", null),
                     hasLyrics = obj.optBoolean("hasLyrics", false),
                     hasSyncedLyrics = obj.optBoolean("hasSyncedLyrics", false),
                     isInstrumental = obj.optBoolean("isInstrumental", false),
@@ -195,6 +240,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _state.update { it.copy(libraryUri = null, tracks = emptyList()) }
     }
 
+    private var lastProgressUpdateTime = 0L
     fun scan() {
         val uri = _state.value.libraryUri ?: return
         scanJob?.cancel()
@@ -202,15 +248,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _state.update { it.copy(isBusy = true, message = "Scanning folder...", operationProgress = 0, operationTotal = 0) }
             notifyProgress("Scanning music folder", 0, 0, true)
             val tracks = repository.scan(uri) { current, total ->
-                _state.update { it.copy(operationProgress = current, operationTotal = total) }
-                val text = if (total > 0) {
-                    "Reading metadata $current of $total"
-                } else if (total < 0) {
-                    "Scanning folders: $current folders, ${-total} audio files found"
-                } else {
-                    "Found $current audio files"
+                val now = System.currentTimeMillis()
+                if (now - lastProgressUpdateTime > 150 || current == total) {
+                    lastProgressUpdateTime = now
+                    _state.update { it.copy(operationProgress = current, operationTotal = total) }
+                    val text = if (total > 0) {
+                        "Reading metadata $current of $total"
+                    } else if (total < 0) {
+                        "Scanning folders: $current folders, ${-total} audio files found"
+                    } else {
+                        "Found $current audio files"
+                    }
+                    notifyProgress(text, if (total > 0) current else 0, if (total > 0) total else 0, total <= 0)
                 }
-                notifyProgress(text, if (total > 0) current else 0, if (total > 0) total else 0, total <= 0)
             }
             _state.update {
                 it.copy(
@@ -267,7 +317,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             notifyProgress("Searching lyrics", 0, tracksToProcess.size, false)
 
             tracksToProcess.forEachIndexed { index, track ->
-                updateTrack(track.id) { it.copy(status = LyricsStatus.Downloading, message = "Checking LRCLIB") }
+                _state.update { it.copy(processingTrackId = track.id) }
                 notifyProgress("Searching ${track.title}", index, tracksToProcess.size, false)
                 
                 // Fetch the result but DON'T save it yet
@@ -304,7 +354,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     kotlinx.coroutines.delay(current.searchDelay * 1000L)
                 }
             }
-            _state.update { it.copy(isBusy = false, isDownloadingAll = false, showDownloadProgress = false, message = "Done") }
+            _state.update { it.copy(isBusy = false, isDownloadingAll = false, showDownloadProgress = false, message = "Done", processingTrackId = null) }
             saveTracks(_state.value.tracks)
             notifyProgress(
                 "Search complete: ${_state.value.foundCount} found, ${_state.value.notFoundCount} missing",
@@ -343,13 +393,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             var failed = 0
             fetched.forEach { (trackId, lyrics) ->
                 val track = tracks.find { it.id == trackId } ?: return@forEach
-                updateTrack(track.id) { it.copy(status = LyricsStatus.Downloading, message = "Saving...") }
+                _state.update { it.copy(processingTrackId = track.id) }
                 notifyProgress("Exporting ${track.title}", count, fetched.size, false)
                 
                 val result = repository.saveManualLyrics(track, lyrics, true, current.outputModes)
                 updateTrack(track.id) { result }
                 count++
-                if (result.status == LyricsStatus.Saved) saved++ else failed++
+                
+                if (result.status == LyricsStatus.Saved) {
+                    saved++
+                    // Remove from fetched map only on success
+                    _state.update { it.copy(fetchedLyrics = it.fetchedLyrics - trackId) }
+                } else {
+                    failed++
+                }
                 
                 val logEntry = "${track.title}: ${result.message}"
                 _state.update { s ->
@@ -363,7 +420,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 notifyProgress("${result.message}: ${track.title}", count, fetched.size, false)
             }
-            _state.update { it.copy(isBusy = false, isDownloadingAll = false, showDownloadProgress = false, message = "Export complete: $saved saved, $failed failed", fetchedLyrics = emptyMap()) }
+            _state.update { it.copy(isBusy = false, isDownloadingAll = false, showDownloadProgress = false, message = "Export complete: $saved saved, $failed failed", fetchedLyrics = emptyMap(), processingTrackId = null) }
             saveTracks(_state.value.tracks)
             notifyProgress(
                 "Export complete: $saved saved, $failed failed",
@@ -392,7 +449,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun downloadTrack(track: TrackItem) {
         viewModelScope.launch {
-            updateTrack(track.id) { it.copy(status = LyricsStatus.Downloading, message = "Searching LRCLIB") }
+            _state.update { it.copy(processingTrackId = track.id) }
             val lyricsResult: LyricsLookupResult? = repository.getLyricsResultForTrack(track)
             
             if (lyricsResult != null) {
@@ -402,6 +459,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             } else {
                 updateTrack(track.id) { it.copy(status = LyricsStatus.Missing, message = "No lyrics found") }
             }
+            _state.update { it.copy(processingTrackId = null) }
             saveTracks(_state.value.tracks)
         }
     }
@@ -516,6 +574,130 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _state.update { it.copy(selectedTrackIds = emptySet()) }
     }
 
+    fun selectAll() {
+        _state.update { it.copy(selectedTrackIds = it.filteredTracks.map { track -> track.id }.toSet()) }
+    }
+
+    fun setSearchQuery(query: String) {
+        _state.update { it.copy(searchQuery = query) }
+    }
+
+    fun setFilterStatus(status: LyricsStatus?) {
+        _state.update { it.copy(filterStatus = status) }
+    }
+
+    fun toggleAudio(track: TrackItem) {
+        val current = _state.value
+        if (current.playingTrackId == track.id && current.isPlaying) {
+            pauseAudio()
+        } else {
+            playAudio(track)
+        }
+    }
+
+    private fun playAudio(track: TrackItem) {
+        viewModelScope.launch {
+            runCatching {
+                val focusResult = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                    val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                        .setAudioAttributes(
+                            AudioAttributes.Builder()
+                                .setUsage(AudioAttributes.USAGE_MEDIA)
+                                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                                .build()
+                        )
+                        .setOnAudioFocusChangeListener(audioFocusChangeListener)
+                        .build()
+                    audioFocusRequest = request
+                    audioManager.requestAudioFocus(request)
+                } else {
+                    @Suppress("DEPRECATION")
+                    audioManager.requestAudioFocus(
+                        audioFocusChangeListener,
+                        AudioManager.STREAM_MUSIC,
+                        AudioManager.AUDIOFOCUS_GAIN
+                    )
+                }
+
+                if (focusResult != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) return@launch
+
+                mediaPlayer?.release()
+                playbackJob?.cancel()
+                mediaPlayer = MediaPlayer().apply {
+                    setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .build()
+                    )
+                    setDataSource(getApplication(), track.audioUri)
+                    prepare()
+                    start()
+                    setOnCompletionListener {
+                        stopPlaybackTracking()
+                        _state.update { it.copy(isPlaying = false, playingTrackId = null, playbackPositionMs = 0) }
+                        abandonAudioFocus()
+                    }
+                }
+                _state.update { it.copy(isPlaying = true, playingTrackId = track.id) }
+                startPlaybackTracking()
+            }.onFailure { e ->
+                _state.update { it.copy(message = "Playback error: ${e.message}") }
+            }
+        }
+    }
+
+    private fun abandonAudioFocus() {
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            audioFocusRequest?.let { audioManager.abandonAudioFocusRequest(it) }
+        } else {
+            @Suppress("DEPRECATION")
+            audioManager.abandonAudioFocus(audioFocusChangeListener)
+        }
+    }
+
+    private fun startPlaybackTracking() {
+        playbackJob?.cancel()
+        playbackJob = viewModelScope.launch {
+            while (true) {
+                val pos = mediaPlayer?.currentPosition ?: 0
+                if (_state.value.playbackPositionMs / 500 != pos / 500) {
+                    _state.update { it.copy(playbackPositionMs = pos) }
+                }
+                kotlinx.coroutines.delay(200)
+            }
+        }
+    }
+
+    private fun stopPlaybackTracking() {
+        playbackJob?.cancel()
+        playbackJob = null
+    }
+
+    private fun pauseAudio() {
+        mediaPlayer?.pause()
+        stopPlaybackTracking()
+        abandonAudioFocus()
+        _state.update { it.copy(isPlaying = false) }
+    }
+
+    fun stopAudio() {
+        mediaPlayer?.stop()
+        mediaPlayer?.release()
+        mediaPlayer = null
+        stopPlaybackTracking()
+        abandonAudioFocus()
+        _state.update { it.copy(isPlaying = false, playingTrackId = null, playbackPositionMs = 0) }
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        mediaPlayer?.release()
+        mediaPlayer = null
+        stopPlaybackTracking()
+        abandonAudioFocus()
+    }
+
     fun deleteSelectedLyrics() {
         val selectedIds = _state.value.selectedTrackIds
         if (selectedIds.isEmpty()) return
@@ -554,6 +736,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         notificationManager.createNotificationChannel(channel)
     }
 
+    private var lastNotificationTime = 0L
+
     private fun notifyProgress(
         text: String,
         progress: Int,
@@ -561,6 +745,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         indeterminate: Boolean,
         ongoing: Boolean = true
     ) {
+        val now = System.currentTimeMillis()
+        if (ongoing && !indeterminate && max > 0 && progress < max && now - lastNotificationTime < 500) {
+            return
+        }
+        lastNotificationTime = now
+
         val app = getApplication<Application>()
         val contentIntent = PendingIntent.getActivity(
             app,
