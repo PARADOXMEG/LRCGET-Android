@@ -8,9 +8,12 @@ import android.provider.DocumentsContract
 import app.lrcget.android.model.LyricsOutputMode
 import app.lrcget.android.model.LyricsStatus
 import app.lrcget.android.model.TrackItem
+import androidx.core.net.toUri
 import kotlinx.coroutines.*
 import org.jaudiotagger.audio.AudioFileIO
 import org.jaudiotagger.tag.FieldKey
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
 import java.text.Collator
@@ -76,13 +79,13 @@ class MusicLibraryRepository(private val context: Context) {
                         audioInDirectory.add(docUri to name)
                         parentFolders[docUri.toString()] = parent
                     } else if (name.endsWith(".lrc", ignoreCase = true)) {
-                        lrcBaseNames.add(name.substringBeforeLast('.').lowercase())
+                        lrcBaseNames.add(name.substringBeforeLast('.').lowercase().trim())
                     }
                 }
             }
 
             audioInDirectory.forEach { (uri, name) ->
-                val baseName = name.substringBeforeLast('.', name).lowercase()
+                val baseName = name.substringBeforeLast('.', name).lowercase().trim()
                 foundFiles.add(
                     ScannedAudioFile(
                         uri = uri,
@@ -152,12 +155,15 @@ class MusicLibraryRepository(private val context: Context) {
 
         val hasSynced = hasLrc || metadata.hasSyncedEmbeddedLyrics
         val hasAnyLyrics = hasLrc || metadata.hasEmbeddedLyrics
+        val isInstrumental = metadata.lyrics.contains("Instrumental", ignoreCase = true) && 
+                            (metadata.lyrics.contains("[00:00.00]") || metadata.lyrics.lines().size <= 2)
         
-        val initialStatus = if (hasAnyLyrics) LyricsStatus.Saved else LyricsStatus.Ready
+        val initialStatus = if (hasAnyLyrics || isInstrumental) LyricsStatus.Saved else LyricsStatus.Ready
         val initialMessage = when {
             hasLrc -> "LRC file present"
             metadata.hasSyncedEmbeddedLyrics -> "Embedded synced"
             metadata.hasEmbeddedLyrics -> "Embedded plain"
+            isInstrumental -> "Instrumental"
             else -> ""
         }
 
@@ -186,7 +192,7 @@ class MusicLibraryRepository(private val context: Context) {
             artUri = artPath,
             hasLyrics = hasAnyLyrics,
             hasSyncedLyrics = hasSynced,
-            isInstrumental = false,
+            isInstrumental = isInstrumental,
             status = initialStatus,
             message = initialMessage
         )
@@ -418,6 +424,73 @@ class MusicLibraryRepository(private val context: Context) {
         }
     }
 
+    fun saveTracks(tracks: List<TrackItem>) {
+        runCatching {
+            val array = JSONArray()
+            tracks.forEach { track ->
+                val obj = JSONObject().apply {
+                    put("id", track.id)
+                    put("audioUri", track.audioUri.toString())
+                    put("parentUri", track.parentUri.toString())
+                    put("fileName", track.fileName)
+                    put("title", track.title)
+                    put("artist", track.artist)
+                    put("album", track.album)
+                    put("durationSeconds", track.durationSeconds)
+                    put("lrcFileName", track.lrcFileName)
+                    put("subtitle", track.subtitle)
+                    put("artUri", track.artUri)
+                    put("hasLyrics", track.hasLyrics)
+                    put("hasSyncedLyrics", track.hasSyncedLyrics)
+                    put("isInstrumental", track.isInstrumental)
+                    put("status", track.status.name)
+                    put("message", track.message)
+                }
+                array.put(obj)
+            }
+            context.openFileOutput("tracks_cache.json", Context.MODE_PRIVATE).use {
+                it.write(array.toString().toByteArray())
+            }
+        }
+    }
+
+    fun loadTracks(rootUri: Uri? = null): List<TrackItem> {
+        return try {
+            val file = File(context.filesDir, "tracks_cache.json")
+            if (!file.exists()) return emptyList()
+            val json = file.readText()
+            val array = JSONArray(json)
+            val list = mutableListOf<TrackItem>()
+            for (i in 0 until array.length()) {
+                val obj = array.getJSONObject(i)
+                list.add(TrackItem(
+                    id = obj.getString("id"),
+                    audioUri = obj.getString("audioUri").toUri(),
+                    parentUri = obj.getString("parentUri").toUri(),
+                    fileName = obj.getString("fileName"),
+                    title = obj.getString("title"),
+                    artist = obj.getString("artist"),
+                    album = obj.getString("album"),
+                    durationSeconds = obj.getInt("durationSeconds"),
+                    lrcFileName = obj.getString("lrcFileName"),
+                    subtitle = obj.optString("subtitle", ""),
+                    artUri = obj.optString("artUri", null),
+                    hasLyrics = obj.optBoolean("hasLyrics", false),
+                    hasSyncedLyrics = obj.optBoolean("hasSyncedLyrics", false),
+                    isInstrumental = obj.optBoolean("isInstrumental", false),
+                    status = runCatching { LyricsStatus.valueOf(obj.getString("status")) }.getOrDefault(LyricsStatus.Ready),
+                    message = obj.optString("message", "")
+                ))
+            }
+            if (rootUri != null) {
+                restoreParentFolders(rootUri, list)
+            }
+            list
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
     private fun saveLyricsToFile(
         track: TrackItem,
         parent: ParentDirectory,
@@ -582,7 +655,7 @@ class MusicLibraryRepository(private val context: Context) {
             ?: uri.toString().substringAfterLast('.', "").lowercase()
 
         if (!skipDeepScan && rawExtension in setOf("mp3", "flac", "m4a", "ogg", "opus", "wav", "aac", "wma")) {
-            val tempFile = File(context.cacheDir, "temp_meta_${System.currentTimeMillis()}.$rawExtension")
+            val tempFile = File.createTempFile("lrcget_meta_", ".$rawExtension", context.cacheDir)
             runCatching {
                 resolver.openInputStream(uri)?.use { input ->
                     tempFile.outputStream().use { output -> input.copyTo(output) }
@@ -597,7 +670,7 @@ class MusicLibraryRepository(private val context: Context) {
                 }
 
                 val fileToRead = if (effectiveExtension != rawExtension) {
-                    val renamedFile = File(context.cacheDir, "temp_meta_fixed_${System.currentTimeMillis()}.$effectiveExtension")
+                    val renamedFile = File(context.cacheDir, "${tempFile.nameWithoutExtension}_fixed.$effectiveExtension")
                     tempFile.renameTo(renamedFile)
                     renamedFile
                 } else {
@@ -618,6 +691,7 @@ class MusicLibraryRepository(private val context: Context) {
                         title = tagTitle.ifBlank { metadata.title },
                         artist = tagArtist.ifBlank { metadata.artist },
                         album = tagAlbum.ifBlank { metadata.album },
+                        lyrics = lyrics,
                         hasEmbeddedLyrics = lyrics.isNotBlank(),
                         hasSyncedEmbeddedLyrics = hasSynced,
                         artwork = metadata.artwork ?: tag.firstArtwork?.binaryData
@@ -660,9 +734,16 @@ class MusicLibraryRepository(private val context: Context) {
         val visible = cleaned.filterNot { it.isWhitespace() }
         if (visible.isEmpty()) return ""
 
-        // Only discard if the string is entirely question marks and reasonably long, 
-        // suggesting it was complete garbage from the start.
-        if (visible.length >= 6 && visible.all { it == '?' || it == '？' }) return ""
+        // Discard if the string is entirely question marks
+        if (visible.all { it == '?' || it == '？' }) return ""
+
+        // Count question marks to detect garbled encoding (e.g. "??105???")
+        val qMarkCount = visible.count { it == '?' || it == '？' }
+        val qMarkRatio = qMarkCount.toFloat() / visible.length
+
+        // If more than 50% of the string is question marks and it's long enough to be suspicious,
+        // it's likely a decoding failure.
+        if (visible.length >= 4 && qMarkRatio > 0.5) return ""
 
         return cleaned
     }
@@ -726,6 +807,7 @@ class MusicLibraryRepository(private val context: Context) {
         val artist: String = "",
         val album: String = "",
         val durationSeconds: Int = 0,
+        val lyrics: String = "",
         val hasEmbeddedLyrics: Boolean = false,
         val hasSyncedEmbeddedLyrics: Boolean = false,
         val artwork: ByteArray? = null
@@ -737,6 +819,7 @@ class MusicLibraryRepository(private val context: Context) {
             if (artist != other.artist) return false
             if (album != other.album) return false
             if (durationSeconds != other.durationSeconds) return false
+            if (lyrics != other.lyrics) return false
             if (hasEmbeddedLyrics != other.hasEmbeddedLyrics) return false
             if (hasSyncedEmbeddedLyrics != other.hasSyncedEmbeddedLyrics) return false
             if (artwork != null) {
@@ -750,7 +833,8 @@ class MusicLibraryRepository(private val context: Context) {
             var result = title.hashCode()
             result = 31 * result + artist.hashCode()
             result = 31 * result + album.hashCode()
-            result = 31 * result + durationSeconds
+            result = 31 * result + durationSeconds.hashCode()
+            result = 31 * result + lyrics.hashCode()
             result = 31 * result + hasEmbeddedLyrics.hashCode()
             result = 31 * result + hasSyncedEmbeddedLyrics.hashCode()
             result = 31 * result + (artwork?.contentHashCode() ?: 0)

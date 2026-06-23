@@ -108,7 +108,7 @@ object Id3SyncedLyricsWriter {
             val matches = tagPattern.findAll(rawLine).toList()
             val text = rawLine.replace(tagPattern, "").trim()
             if (matches.isEmpty()) {
-                emptySequence<SyncedLine>()
+                emptySequence()
             } else {
                 matches.asSequence().mapNotNull { match ->
                     val minutes = match.groupValues[1].toIntOrNull() ?: return@mapNotNull null
@@ -148,9 +148,6 @@ object Id3SyncedLyricsWriter {
 
     private fun intBytes(size: Int): ByteArray =
         ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(size).array()
-
-    private fun List<SyncedLine>.toPlainLyrics(): String =
-        joinToString("\n") { it.text }
 
     private data class ExistingTag(
         val majorVersion: Int,

@@ -10,6 +10,10 @@ import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.media.MediaPlayer
+import android.media.MediaMetadata
+import android.media.session.MediaSession
+import android.media.session.PlaybackState
+import android.graphics.drawable.Icon
 import android.net.Uri
 import androidx.compose.runtime.Stable
 import androidx.core.content.edit
@@ -17,12 +21,16 @@ import androidx.core.net.toUri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import app.lrcget.android.data.LyricsLookupResult
+import app.lrcget.android.data.LrclibClient
 import app.lrcget.android.data.MusicLibraryRepository
 import app.lrcget.android.model.DownloadMode
 import app.lrcget.android.model.LyricsOutputMode
 import app.lrcget.android.model.LyricsStatus
 import app.lrcget.android.model.ThemeMode
 import app.lrcget.android.model.TrackItem
+import app.lrcget.android.service.LyricsDownloadService
+import app.lrcget.android.service.DownloadProgress
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
@@ -31,6 +39,28 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+
+enum class TrackFilter {
+    All,
+    Saved,
+    Found,
+    Missing,
+    NotChecked,
+    EmbeddedSynced,
+    EmbeddedPlain,
+    LrcFile;
+
+    fun label(): String = when (this) {
+        All -> "All"
+        Saved -> "Saved"
+        Found -> "Found"
+        Missing -> "Missing"
+        NotChecked -> "Not Checked"
+        EmbeddedSynced -> "Embedded Synced"
+        EmbeddedPlain -> "Embedded Plain"
+        LrcFile -> "LRC File"
+    }
+}
 
 @Stable
 data class MainUiState(
@@ -62,12 +92,17 @@ data class MainUiState(
     val fetchedLyrics: Map<String, LyricsLookupResult> = emptyMap(),
     val selectedTrackIds: Set<String> = emptySet(),
     val searchQuery: String = "",
-    val filterStatus: LyricsStatus? = null,
+    val filterMode: TrackFilter = TrackFilter.All,
     val isPlaying: Boolean = false,
     val playingTrackId: String? = null,
     val playbackPositionMs: Int = 0,
+    val playbackDurationMs: Int = 0,
     val processingTrackId: String? = null,
     val isRestoring: Boolean = true,
+    val isPublishing: Boolean = false,
+    val publishStatus: String? = null,
+    val isExporting: Boolean = false,
+    val isPreviewLoading: Boolean = false
 ) {
     val filteredTracks: List<TrackItem>
         get() = tracks.filter { track ->
@@ -75,16 +110,28 @@ data class MainUiState(
                 track.title.contains(searchQuery, ignoreCase = true) || 
                 track.artist.contains(searchQuery, ignoreCase = true) ||
                 track.album.contains(searchQuery, ignoreCase = true)
-            val matchesFilter = filterStatus == null || track.status == filterStatus
+            
+            val matchesFilter = when (filterMode) {
+                TrackFilter.All -> true
+                TrackFilter.Saved -> track.status == LyricsStatus.Saved
+                TrackFilter.Found -> track.status == LyricsStatus.Found
+                TrackFilter.Missing -> track.status == LyricsStatus.Missing
+                TrackFilter.NotChecked -> track.status == LyricsStatus.Ready
+                TrackFilter.EmbeddedSynced -> track.message.contains("Embedded synced", ignoreCase = true)
+                TrackFilter.EmbeddedPlain -> track.message.contains("Embedded plain", ignoreCase = true)
+                TrackFilter.LrcFile -> track.message.contains("LRC", ignoreCase = true)
+            }
             matchesQuery && matchesFilter
         }
 
     val savedCount: Int get() = tracks.count { it.status == LyricsStatus.Saved }
     val missingCount: Int get() = tracks.count { it.status == LyricsStatus.Missing }
+    val foundGlobalCount: Int get() = tracks.count { it.status == LyricsStatus.Found }
 }
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val repository = MusicLibraryRepository(application)
+    private val lrclibClient = LrclibClient()
     private val prefs = application.getSharedPreferences("lrcget_prefs", android.content.Context.MODE_PRIVATE)
     private val notificationManager = application.getSystemService(NotificationManager::class.java)
     private val _state = MutableStateFlow(MainUiState())
@@ -93,6 +140,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var scanJob: kotlinx.coroutines.Job? = null
     private var mediaPlayer: MediaPlayer? = null
     private var playbackJob: kotlinx.coroutines.Job? = null
+    private var mediaSession: android.media.session.MediaSession? = null
+    private var currentPlayingTrack: TrackItem? = null
     
     private val audioManager = application.getSystemService(Application.AUDIO_SERVICE) as AudioManager
     private var audioFocusRequest: AudioFocusRequest? = null
@@ -107,8 +156,86 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     init {
         createNotificationChannel()
         restoreSettings()
+        setupMediaSession()
         viewModelScope.launch {
             restoreLibrary()
+        }
+        observeDownloadService()
+    }
+
+    private fun observeDownloadService() {
+        viewModelScope.launch {
+            LyricsDownloadService.progressFlow.collect { progress ->
+                when (progress) {
+                    is DownloadProgress.Scanning -> {
+                        _state.update { it.copy(
+                            isBusy = true,
+                            isDownloadingAll = true,
+                            operationProgress = progress.current,
+                            operationTotal = progress.total,
+                            message = if (progress.total > 0) "Scanning metadata..." else "Scanning folders..."
+                        ) }
+                    }
+                    is DownloadProgress.Processing -> {
+                        val logEntry = "${progress.trackTitle}: ${progress.message}"
+                        updateTrack(progress.trackId) { it.copy(status = progress.status, message = progress.message) }
+                        _state.update { s ->
+                            s.copy(
+                                isBusy = true,
+                                isDownloadingAll = true,
+                                isExporting = progress.isExport,
+                                message = "Processing ${progress.current} of ${progress.total}",
+                                operationProgress = progress.current,
+                                operationTotal = progress.total,
+                                downloadLog = listOf(logEntry) + s.downloadLog.take(99),
+                                foundCount = if (progress.status == LyricsStatus.Found || progress.status == LyricsStatus.Saved) s.foundCount + 1 else s.foundCount,
+                                notFoundCount = if (progress.status == LyricsStatus.Missing) s.notFoundCount + 1 else s.notFoundCount,
+                                fetchedLyrics = if (progress.lyrics != null) s.fetchedLyrics + (progress.trackId to progress.lyrics) else s.fetchedLyrics
+                            )
+                        }
+                    }
+                    is DownloadProgress.Done -> {
+                        _state.update { it.copy(
+                            isBusy = false,
+                            isDownloadingAll = false,
+                            isExporting = false,
+                            showDownloadProgress = false,
+                            message = if (progress.failed > 0) "Complete with ${progress.failed} errors" else "Operation complete",
+                            fetchedLyrics = if (progress.isExport) emptyMap() else it.fetchedLyrics
+                        ) }
+                        if (progress.isExport) {
+                            scan() // Auto-refresh ONLY after export
+                        }
+                    }
+                    is DownloadProgress.Error -> {
+                        _state.update { it.copy(
+                            isBusy = false,
+                            isDownloadingAll = false,
+                            isExporting = false,
+                            message = "Error: ${progress.message}"
+                        ) }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun setupMediaSession() {
+        mediaSession = android.media.session.MediaSession(getApplication(), "LRCGET").apply {
+            setCallback(object : android.media.session.MediaSession.Callback() {
+                override fun onPlay() {
+                    currentPlayingTrack?.let { playAudio(it) }
+                }
+                override fun onPause() {
+                    pauseAudio()
+                }
+                override fun onStop() {
+                    stopAudio()
+                }
+                override fun onSeekTo(pos: Long) {
+                    seekTo(pos.toInt())
+                }
+            })
         }
     }
 
@@ -147,10 +274,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         if (hasPermission) {
-            val cachedTracks = withContext(kotlinx.coroutines.Dispatchers.IO) { loadTracks() }
-            if (cachedTracks.isNotEmpty()) {
-                repository.restoreParentFolders(uri, cachedTracks)
-            }
+            val cachedTracks = withContext(kotlinx.coroutines.Dispatchers.IO) { repository.loadTracks(uri) }
             _state.update { it.copy(
                 libraryUri = uri, 
                 tracks = cachedTracks,
@@ -164,69 +288,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun saveTracks(tracks: List<TrackItem>) {
         viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
-            runCatching {
-                val array = JSONArray()
-                tracks.forEach { track ->
-                    val obj = JSONObject().apply {
-                        put("id", track.id)
-                        put("audioUri", track.audioUri.toString())
-                        put("parentUri", track.parentUri.toString())
-                        put("fileName", track.fileName)
-                        put("title", track.title)
-                        put("artist", track.artist)
-                        put("album", track.album)
-                        put("durationSeconds", track.durationSeconds)
-                        put("lrcFileName", track.lrcFileName)
-                        put("subtitle", track.subtitle)
-                        put("artUri", track.artUri)
-                        put("hasLyrics", track.hasLyrics)
-                        put("hasSyncedLyrics", track.hasSyncedLyrics)
-                        put("isInstrumental", track.isInstrumental)
-                        put("status", track.status.name)
-                        put("message", track.message)
-                    }
-                    array.put(obj)
-                }
-                getApplication<Application>().openFileOutput("tracks_cache.json", android.content.Context.MODE_PRIVATE).use {
-                    it.write(array.toString().toByteArray())
-                }
-            }
+            repository.saveTracks(tracks)
         }
     }
 
-    private fun loadTracks(): List<TrackItem> {
-        return try {
-            val file = File(getApplication<Application>().filesDir, "tracks_cache.json")
-            if (!file.exists()) return emptyList()
-            val json = file.readText()
-            val array = JSONArray(json)
-            val list = mutableListOf<TrackItem>()
-            for (i in 0 until array.length()) {
-                val obj = array.getJSONObject(i)
-                list.add(TrackItem(
-                    id = obj.getString("id"),
-                    audioUri = obj.getString("audioUri").toUri(),
-                    parentUri = obj.getString("parentUri").toUri(),
-                    fileName = obj.getString("fileName"),
-                    title = obj.getString("title"),
-                    artist = obj.getString("artist"),
-                    album = obj.getString("album"),
-                    durationSeconds = obj.getInt("durationSeconds"),
-                    lrcFileName = obj.getString("lrcFileName"),
-                    subtitle = obj.optString("subtitle", ""),
-                    artUri = obj.optString("artUri", null),
-                    hasLyrics = obj.optBoolean("hasLyrics", false),
-                    hasSyncedLyrics = obj.optBoolean("hasSyncedLyrics", false),
-                    isInstrumental = obj.optBoolean("isInstrumental", false),
-                    status = runCatching { LyricsStatus.valueOf(obj.getString("status")) }.getOrDefault(LyricsStatus.Ready),
-                    message = obj.optString("message", "")
-                ))
-            }
-            list
-        } catch (e: Exception) {
-            emptyList()
-        }
-    }
 
     fun setLibrary(uri: Uri) {
         prefs.edit { putString("library_uri", uri.toString()) }
@@ -285,154 +350,91 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun downloadAll() {
         val tracks = _state.value.tracks
         if (tracks.isEmpty()) return
+        val current = _state.value
+        val rootUri = current.libraryUri ?: return
 
-        downloadJob?.cancel()
-        downloadJob = viewModelScope.launch {
-            val current = _state.value
-            
-            val tracksToProcess = tracks.filter { track ->
-                when (current.downloadMode) {
-                    DownloadMode.All -> true
-                    DownloadMode.MissingSynced -> !track.hasSyncedLyrics
-                    DownloadMode.MissingAny -> !track.hasLyrics
-                }
-            }
+        _state.update { it.copy(
+            isDownloadingAll = true,
+            isExporting = false,
+            showDownloadProgress = true,
+            isBusy = true, 
+            message = "Starting background search...",
+            operationProgress = 0,
+            downloadLog = emptyList(),
+            foundCount = 0,
+            notFoundCount = 0,
+            fetchedLyrics = emptyMap() // Clear old search results
+        ) }
 
-            if (tracksToProcess.isEmpty()) {
-                _state.update { it.copy(message = "All lyrics are already up to date") }
-                return@launch
-            }
-
-            _state.update { it.copy(
-                isDownloadingAll = true,
-                showDownloadProgress = true,
-                isBusy = true, 
-                message = "Searching lyrics...",
-                operationProgress = 0,
-                operationTotal = tracksToProcess.size,
-                downloadLog = emptyList(),
-                foundCount = 0,
-                notFoundCount = 0
-            ) }
-            notifyProgress("Searching lyrics", 0, tracksToProcess.size, false)
-
-            tracksToProcess.forEachIndexed { index, track ->
-                _state.update { it.copy(processingTrackId = track.id) }
-                notifyProgress("Searching ${track.title}", index, tracksToProcess.size, false)
-                
-                // Fetch the result but DON'T save it yet
-                val lyricsResult: LyricsLookupResult? = repository.getLyricsResultForTrack(track)
-                
-                val status = if (lyricsResult != null) {
-                    _state.update { it.copy(fetchedLyrics = it.fetchedLyrics + (track.id to lyricsResult)) }
-                    LyricsStatus.Found
-                } else {
-                    LyricsStatus.Missing
-                }
-                
-                val msg = if (lyricsResult != null) {
-                    if (lyricsResult.isInstrumental) "Instrumental found" else if (lyricsResult.isSynced) "Synced found" else "Plain found"
-                } else {
-                    "No lyrics found"
-                }
-
-                updateTrack(track.id) { it.copy(status = status, message = msg) }
-                
-                val logEntry = "${track.title}: $msg"
-                _state.update { s ->
-                    s.copy(
-                        message = "Processed ${index + 1} of ${tracksToProcess.size}",
-                        operationProgress = index + 1,
-                        downloadLog = listOf(logEntry) + s.downloadLog.take(99),
-                        foundCount = if (status == LyricsStatus.Found) s.foundCount + 1 else s.foundCount,
-                        notFoundCount = if (status == LyricsStatus.Missing) s.notFoundCount + 1 else s.notFoundCount
-                    )
-                }
-                notifyProgress("$msg: ${track.title}", index + 1, tracksToProcess.size, false)
-
-                if (index < tracksToProcess.size - 1) {
-                    kotlinx.coroutines.delay(current.searchDelay * 1000L)
-                }
-            }
-            _state.update { it.copy(isBusy = false, isDownloadingAll = false, showDownloadProgress = false, message = "Done", processingTrackId = null) }
-            saveTracks(_state.value.tracks)
-            notifyProgress(
-                "Search complete: ${_state.value.foundCount} found, ${_state.value.notFoundCount} missing",
-                tracksToProcess.size,
-                tracksToProcess.size,
-                indeterminate = false,
-                ongoing = false
-            )
-        }
+        LyricsDownloadService.start(
+            getApplication(),
+            rootUri,
+            current.downloadMode,
+            current.outputModes,
+            current.searchDelay,
+            isExport = false
+        )
     }
 
     fun exportAll() {
         val tracks = _state.value.tracks
-        val fetched = _state.value.fetchedLyrics
-        if (fetched.isEmpty()) {
-            _state.update { it.copy(message = "Nothing to export. Search first.") }
+        val current = _state.value
+        val rootUri = current.libraryUri ?: return
+
+        if (current.fetchedLyrics.isEmpty()) {
+            _state.update { it.copy(message = "No lyrics found to export. Please run 'Find Lyrics Online' first.") }
             return
         }
 
-        viewModelScope.launch {
-            val current = _state.value
-            _state.update { it.copy(
-                isDownloadingAll = true,
-                showDownloadProgress = true, 
-                message = "Exporting lyrics...",
-                operationProgress = 0,
-                operationTotal = fetched.size,
-                downloadLog = emptyList(),
-                foundCount = 0,
-                notFoundCount = 0
-            ) }
-            notifyProgress("Exporting lyrics", 0, fetched.size, false)
-
-            var count = 0
-            var saved = 0
-            var failed = 0
-            fetched.forEach { (trackId, lyrics) ->
-                val track = tracks.find { it.id == trackId } ?: return@forEach
-                _state.update { it.copy(processingTrackId = track.id) }
-                notifyProgress("Exporting ${track.title}", count, fetched.size, false)
-                
-                val result = repository.saveManualLyrics(track, lyrics, true, current.outputModes)
-                updateTrack(track.id) { result }
-                count++
-                
-                if (result.status == LyricsStatus.Saved) {
-                    saved++
-                    // Remove from fetched map only on success
-                    _state.update { it.copy(fetchedLyrics = it.fetchedLyrics - trackId) }
-                } else {
-                    failed++
+        viewModelScope.launch(Dispatchers.IO) {
+            // Save fetchedLyrics to a file for the Service to pick up
+            try {
+                val file = File(getApplication<Application>().filesDir, "export_lyrics.json")
+                val root = JSONObject()
+                current.fetchedLyrics.forEach { (id, result) ->
+                    val obj = JSONObject().apply {
+                        put("lyrics", result.lyrics)
+                        put("isSynced", result.isSynced)
+                        put("isInstrumental", result.isInstrumental)
+                        put("trackName", result.trackName)
+                        put("artistName", result.artistName)
+                        put("albumName", result.albumName)
+                        put("duration", result.duration)
+                    }
+                    root.put(id, obj)
                 }
-                
-                val logEntry = "${track.title}: ${result.message}"
-                _state.update { s ->
-                    s.copy(
-                        message = "Exporting $count of ${fetched.size}",
-                        operationProgress = count,
-                        downloadLog = listOf(logEntry) + s.downloadLog.take(99),
-                        foundCount = if (result.status == LyricsStatus.Saved) s.foundCount + 1 else s.foundCount,
-                        notFoundCount = if (result.status == LyricsStatus.Saved) s.notFoundCount else s.notFoundCount + 1
+                file.writeText(root.toString())
+
+                withContext(Dispatchers.Main) {
+                    _state.update { it.copy(
+                        isDownloadingAll = true,
+                        showDownloadProgress = true, 
+                        message = "Starting background export...",
+                        operationProgress = 0,
+                        downloadLog = emptyList(),
+                        foundCount = 0,
+                        notFoundCount = 0
+                    ) }
+
+                    LyricsDownloadService.start(
+                        getApplication(),
+                        rootUri,
+                        current.downloadMode,
+                        current.outputModes,
+                        current.searchDelay,
+                        isExport = true
                     )
                 }
-                notifyProgress("${result.message}: ${track.title}", count, fetched.size, false)
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    _state.update { it.copy(message = "Failed to prepare export: ${e.localizedMessage}") }
+                }
             }
-            _state.update { it.copy(isBusy = false, isDownloadingAll = false, showDownloadProgress = false, message = "Export complete: $saved saved, $failed failed", fetchedLyrics = emptyMap(), processingTrackId = null) }
-            saveTracks(_state.value.tracks)
-            notifyProgress(
-                "Export complete: $saved saved, $failed failed",
-                fetched.size,
-                fetched.size,
-                indeterminate = false,
-                ongoing = false
-            )
         }
     }
 
     fun stopDownload() {
+        getApplication<Application>().stopService(Intent(getApplication(), LyricsDownloadService::class.java))
         downloadJob?.cancel()
         scanJob?.cancel()
         _state.update { it.copy(isBusy = false, isDownloadingAll = false, showDownloadProgress = false, message = "Download stopped") }
@@ -466,11 +468,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun previewLyrics(track: TrackItem) {
         viewModelScope.launch {
-            _state.update { it.copy(isBusy = true, previewTrack = track, previewResults = emptyList()) }
+            _state.update { it.copy(isPreviewLoading = true, previewTrack = track, previewResults = emptyList()) }
             val results = repository.getAllLyricsForPreview(track)
             _state.update {
                 it.copy(
-                    isBusy = false,
+                    isPreviewLoading = false,
                     previewResults = results,
                     previewLyrics = results.firstOrNull()?.lyrics
                 )
@@ -497,9 +499,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun searchLyricsForPreview(trackName: String, artistName: String = "", albumName: String = "") {
         viewModelScope.launch {
-            _state.update { it.copy(isBusy = true) }
+            _state.update { it.copy(isPreviewLoading = true) }
             val results = repository.searchLyricsManual(trackName, artistName, albumName)
-            _state.update { it.copy(isBusy = false, previewResults = results) }
+            _state.update { it.copy(isPreviewLoading = false, previewResults = results) }
         }
     }
 
@@ -582,8 +584,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _state.update { it.copy(searchQuery = query) }
     }
 
-    fun setFilterStatus(status: LyricsStatus?) {
-        _state.update { it.copy(filterStatus = status) }
+    fun setFilterMode(mode: TrackFilter) {
+        _state.update { it.copy(filterMode = mode) }
     }
 
     fun toggleAudio(track: TrackItem) {
@@ -621,30 +623,141 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
                 if (focusResult != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) return@launch
 
-                mediaPlayer?.release()
-                playbackJob?.cancel()
-                mediaPlayer = MediaPlayer().apply {
-                    setAudioAttributes(
-                        AudioAttributes.Builder()
-                            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                            .setUsage(AudioAttributes.USAGE_MEDIA)
-                            .build()
-                    )
-                    setDataSource(getApplication(), track.audioUri)
-                    prepare()
-                    start()
-                    setOnCompletionListener {
-                        stopPlaybackTracking()
-                        _state.update { it.copy(isPlaying = false, playingTrackId = null, playbackPositionMs = 0) }
-                        abandonAudioFocus()
+                if (currentPlayingTrack?.id == track.id && mediaPlayer != null) {
+                    mediaPlayer?.start()
+                } else {
+                    currentPlayingTrack = track
+                    mediaPlayer?.release()
+                    playbackJob?.cancel()
+                    mediaPlayer = MediaPlayer().apply {
+                        setAudioAttributes(
+                            AudioAttributes.Builder()
+                                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                                .setUsage(AudioAttributes.USAGE_MEDIA)
+                                .build()
+                        )
+                        setDataSource(getApplication(), track.audioUri)
+                        prepare()
+                        val duration = duration
+                        _state.update { it.copy(playbackDurationMs = duration) }
+                        start()
+                        setOnCompletionListener {
+                            stopPlaybackTracking()
+                            _state.update { it.copy(isPlaying = false, playingTrackId = null, playbackPositionMs = 0) }
+                            currentPlayingTrack = null
+                            abandonAudioFocus()
+                            updateMediaSession(null)
+                        }
                     }
                 }
                 _state.update { it.copy(isPlaying = true, playingTrackId = track.id) }
                 startPlaybackTracking()
+                updateMediaSession(track)
             }.onFailure { e ->
                 _state.update { it.copy(message = "Playback error: ${e.message}") }
             }
         }
+    }
+
+    private fun updateMediaSession(track: TrackItem?) {
+        val session = mediaSession ?: return
+        if (track == null) {
+            session.isActive = false
+            notificationManager.cancel(PLAYBACK_NOTIFICATION_ID)
+            return
+        }
+
+        val metadataBuilder = android.media.MediaMetadata.Builder()
+            .putString(android.media.MediaMetadata.METADATA_KEY_TITLE, track.title)
+            .putString(android.media.MediaMetadata.METADATA_KEY_ARTIST, track.artist)
+            .putString(android.media.MediaMetadata.METADATA_KEY_ALBUM, track.album)
+            .putLong(android.media.MediaMetadata.METADATA_KEY_DURATION, track.durationSeconds * 1000L)
+
+        // Load artwork for media session if available
+        track.artUri?.let { path ->
+            runCatching {
+                val bitmap = android.graphics.BitmapFactory.decodeFile(path)
+                if (bitmap != null) {
+                    metadataBuilder.putBitmap(android.media.MediaMetadata.METADATA_KEY_ALBUM_ART, bitmap)
+                }
+            }
+        }
+
+        session.setMetadata(metadataBuilder.build())
+
+        val isPlaying = _state.value.isPlaying
+        val state = if (isPlaying) {
+            android.media.session.PlaybackState.STATE_PLAYING
+        } else {
+            android.media.session.PlaybackState.STATE_PAUSED
+        }
+
+        val currentPos = mediaPlayer?.currentPosition?.toLong() ?: _state.value.playbackPositionMs.toLong()
+
+        session.setPlaybackState(android.media.session.PlaybackState.Builder()
+            .setActions(
+                android.media.session.PlaybackState.ACTION_PLAY or
+                android.media.session.PlaybackState.ACTION_PAUSE or
+                android.media.session.PlaybackState.ACTION_STOP or
+                android.media.session.PlaybackState.ACTION_SEEK_TO
+            )
+            .setState(state, currentPos, if (isPlaying) 1.0f else 0.0f)
+            .build())
+
+        session.isActive = true
+        showPlaybackNotification(track)
+    }
+
+    private fun showPlaybackNotification(track: TrackItem) {
+        val app = getApplication<Application>()
+        val contentIntent = PendingIntent.getActivity(
+            app,
+            0,
+            Intent(app, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            },
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        val playPauseIntent = PendingIntent.getBroadcast(
+            app,
+            1,
+            Intent("app.lrcget.android.ACTION_PLAY_PAUSE"),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        val isPlaying = _state.value.isPlaying
+        val actionIcon = if (isPlaying) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play
+        val actionText = if (isPlaying) "Pause" else "Play"
+
+        // Load Large Icon (Cover Art)
+        val largeIcon = track.artUri?.let { path ->
+            runCatching { android.graphics.BitmapFactory.decodeFile(path) }.getOrNull()
+        }
+
+        val notification = Notification.Builder(app, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setLargeIcon(largeIcon)
+            .setContentTitle(track.title)
+            .setContentText(track.artist)
+            .setContentIntent(contentIntent)
+            .setOnlyAlertOnce(true)
+            .setOngoing(isPlaying)
+            .addAction(
+                Notification.Action.Builder(
+                    Icon.createWithResource(app, actionIcon),
+                    actionText,
+                    playPauseIntent
+                ).build()
+            )
+            .setStyle(Notification.MediaStyle()
+                .setMediaSession(mediaSession?.sessionToken)
+                .setShowActionsInCompactView(0)
+            )
+            .setVisibility(Notification.VISIBILITY_PUBLIC)
+            .build()
+
+        notificationManager.notify(PLAYBACK_NOTIFICATION_ID, notification)
     }
 
     private fun abandonAudioFocus() {
@@ -679,21 +792,32 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         stopPlaybackTracking()
         abandonAudioFocus()
         _state.update { it.copy(isPlaying = false) }
+        currentPlayingTrack?.let { updateMediaSession(it) }
     }
 
     fun stopAudio() {
         mediaPlayer?.stop()
         mediaPlayer?.release()
         mediaPlayer = null
+        currentPlayingTrack = null
         stopPlaybackTracking()
         abandonAudioFocus()
         _state.update { it.copy(isPlaying = false, playingTrackId = null, playbackPositionMs = 0) }
+        updateMediaSession(null)
+    }
+
+    fun seekTo(posMs: Int) {
+        mediaPlayer?.seekTo(posMs)
+        _state.update { it.copy(playbackPositionMs = posMs) }
+        currentPlayingTrack?.let { updateMediaSession(it) }
     }
 
     override fun onCleared() {
         super.onCleared()
         mediaPlayer?.release()
         mediaPlayer = null
+        mediaSession?.release()
+        mediaSession = null
         stopPlaybackTracking()
         abandonAudioFocus()
     }
@@ -713,6 +837,33 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _state.update { it.copy(isBusy = false, message = "Deleted ${selectedIds.size} lyrics", selectedTrackIds = emptySet()) }
             saveTracks(_state.value.tracks)
         }
+    }
+
+    fun publishLyrics(
+        trackName: String,
+        artistName: String,
+        albumName: String,
+        duration: Int,
+        plainLyrics: String,
+        syncedLyrics: String
+    ) {
+        viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            _state.update { it.copy(isPublishing = true, publishStatus = "Solving cryptographic challenge...") }
+            val result = lrclibClient.publishLyrics(
+                trackName, artistName, albumName, duration, plainLyrics, syncedLyrics
+            )
+            
+            _state.update { 
+                it.copy(
+                    isPublishing = false, 
+                    publishStatus = if (result.isSuccess) "Success! Lyrics published." else "Failed: ${result.exceptionOrNull()?.message ?: "Unknown error"}"
+                )
+            }
+        }
+    }
+
+    fun clearPublishStatus() {
+        _state.update { it.copy(publishStatus = null) }
     }
 
     private fun updateTrack(id: String, transform: (TrackItem) -> TrackItem) {
@@ -777,5 +928,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     companion object {
         private const val CHANNEL_ID = "lrcget_progress"
         private const val NOTIFICATION_ID = 1001
+        private const val PLAYBACK_NOTIFICATION_ID = 1002
     }
 }

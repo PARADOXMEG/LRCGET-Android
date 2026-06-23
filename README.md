@@ -1,118 +1,86 @@
 # LRCGET Android
 
-Modern Android client for downloading and managing synced lyrics using the LRCLIB API.
+[![Android](https://img.shields.io/badge/Android-8.0%2B-green.svg)](https://developer.android.com)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-This project brings the core workflow of the desktop version of LRCGET to Android while following Android-native design patterns, Material 3 styling, and background processing support.
-
-# Features
-
-## Core Workflow
-
-- **SAF Integration**: Choose your music folder using the Android Storage Access Framework for secure, scoped access.
-- **Recursive Scanning**: Automatically finds audio files in subdirectories.
-- **Enhanced Metadata**: Reads track information (Title, Artist, Album, Artwork) using `MediaMetadataRetriever` and `jaudiotagger`.
-- **Two-Step Processing**:
-  1. **Search**: Bulk search for lyrics across your library with smart title cleaning.
-  2. **Export**: Review found lyrics and export them to your preferred format.
-- **Instrumental Detection**: Automatically identifies and marks instrumental tracks.
-- **Batch Operations**: Support for multi-selecting tracks for downloading, exporting, or deleting lyrics.
-
-## Export & Embedding
-
-- **LRC Files**: Save synchronized `.lrc` files beside your audio tracks.
-- **Plain Text**: Save unsynchronized `.txt` files for simple lyric viewers.
-- **Metadata Embedding**: 
-  - **MP3**: Embeds `SYLT` (synced) and `USLT` (unsynced) ID3 frames.
-  - **Other Formats**: Supports embedding lyrics into FLAC, M4A, OGG, and WAV tags.
-- **Overwrite Control**: Toggle whether to overwrite existing lyrics or skip them.
-
-## User Experience
-
-- **Preview & Playback**: Preview lyrics from multiple search results and use the built-in mini-player to verify tracks.
-- **Manual Search**: Perform manual searches for tracks with missing or incorrect metadata.
-- **Material 3 UI**: Full Material You support with dynamic color surfacing on Android 12+.
-- **AMOLED Mode**: Pure black theme for OLED screens.
-- **Background Processing**: Foreground service with persistent notifications keeps operations running even when the app is in the background.
+**LRCGET Android** is a modern, lightweight utility for downloading and managing synced lyrics for your local music library. Inspired by the [original desktop version](https://github.com/tranxuanthang/lrcget), it brings high-quality lyric fetching and metadata embedding to your Android device with a native, Material 3 experience.
 
 ---
 
-# Supported Audio Formats
+## 🚀 Features
 
-LRCGET Android supports metadata reading and lyric embedding for:
+### 🔍 Smart Lyric Discovery
+*   **LRCLIB Integration:** Fetches high-quality synced and plain text lyrics from the [LRCLIB](https://lrclib.net) database.
+*   **Smart Fallback:** Automatically cleans track titles (removes "feat.", "Remastered", "Live", etc.) and retries searches to improve match rates.
+*   **Instrumental Detection:** Automatically identifies instrumental tracks to skip unnecessary searches.
+*   **Manual Search:** Hand-tune search queries (Track, Artist, Album) for those hard-to-find songs.
 
-- **MP3** (ID3v2.3/v2.4)
-- **FLAC**
-- **M4A / AAC** (MP4 containers)
-- **OGG / OPUS** (Vorbis comments)
-- **WAV**
-- **WMA**
+### 💾 Flexible Output & Embedding
+*   **External Files:** Save lyrics as `.lrc` (synced) or `.txt` (plain text) files alongside your music.
+*   **Deep Tag Embedding:**
+    *   **MP3:** Writes high-compatibility `SYLT` (synchronized) and `USLT` (unsynchronized) ID3v2 frames.
+    *   **Modern Formats:** Full support for embedding lyrics into **FLAC, M4A, OGG, OPUS, WAV, and WMA** tags.
+*   **Batch Operations:** Search for or download lyrics for your entire library or selected tracks in one click.
+
+### 📱 Premium User Experience
+*   **Material 3 UI:** Clean interface with full **Dynamic Color** (Material You) support on Android 12+.
+*   **AMOLED Mode:** A pure black theme optimized for OLED screens.
+*   **Lyrics Preview:** Browse multiple search results and preview lyrics before saving.
+*   **Background Processing:** A dedicated foreground service ensures large library operations finish even if you leave the app.
+*   **Performance:** Scans and processes metadata efficiently with parallel coroutines.
 
 ---
 
-# How It Works
+## 📂 Supported Formats
 
-1. **Select Folder**: Grant access to your music library.
-2. **Scan**: Let the app index your tracks and detect existing lyrics.
-3. **Search**: Run a bulk search to find matches on LRCLIB.
-4. **Review**: Check results, preview lyrics, or manually search if needed.
-5. **Export**: Save the found lyrics as files or embed them directly into your music.
+LRCGET Android handles metadata reading and lyric embedding for:
+*   **MP3** (ID3v2.3/v2.4)
+*   **FLAC**
+*   **M4A / AAC** (MP4 containers)
+*   **OGG** (Vorbis comments)
+*   **WAV**
+*   **WMA**
 
 ---
 
-# Building
+## 🛠️ How It Works
 
-## Requirements
+1.  **Select Music Folder:** Grant access using the Android Storage Access Framework (SAF).
+2.  **Scan Library:** The app indexes your music, extracting metadata and detecting existing lyrics.
+3.  **Search & Match:** Run a bulk search. The app uses smart matching to find the best lyrics on LRCLIB.
+4.  **Review & Download:** Verify results with the built-in previewer and save them to your preferred format.
 
-- Android Studio Koala or newer
-- Android SDK 34+
-- Gradle 8.0+
-- Android 12+ (API 31) recommended for Material You support
+---
 
-## Open Project
+## 🏗️ Building
 
+### Prerequisites
+*   Android Studio Koala (2024.1.1) or newer
+*   Android SDK 35
+*   JDK 17
+
+### Setup
 ```bash
 git clone https://github.com/PARADOXMEG/lrcget-android.git
 ```
-
-Open the project in Android Studio, sync Gradle, and run the `app` configuration.
-
----
-
-# Permissions
-
-The app requests the following permissions for core functionality:
-
-- **Notification Permission**: To show progress for long-running operations.
-- **Storage Access**: Via SAF to read/write your music files.
-- **Foreground Service**: To ensure searches and exports aren't interrupted.
-- **Battery Optimization**: (Optional) To prevent the system from killing the app during large library scans.
+Open in Android Studio, wait for Gradle sync, and run the `app` configuration.
 
 ---
 
-# Credits
+## 📜 Credits
 
-## Original LRCGET Desktop Project
-
-This Android version is based on the original desktop implementation of LRCGET.
-
-Huge credit to the original author and contributors of LRCGET for creating the core workflow.
-
-- GitHub: [tranxuanthang/lrcget](https://github.com/tranxuanthang/lrcget)
-
-## LRCLIB
-
-Lyrics are powered by the LRCLIB API. Special thanks for providing a free, high-quality synced lyrics database.
-
-- Website: [lrclib.net](https://lrclib.net)
+*   **Original LRCGET:** This project is an Android adaptation of the excellent [lrcget](https://github.com/tranxuanthang/lrcget) desktop app.
+*   **LRCLIB:** All lyrics are provided by the [LRCLIB API](https://lrclib.net).
+*   **jaudiotagger:** Used for robust audio tagging support.
 
 ---
 
-# Disclaimer
+## ⚖️ License
 
-This project is an independent Android adaptation and is not officially affiliated with the original desktop project or LRCLIB.
+This project is licensed under the **MIT License**.
 
 ---
 
-# License
+## ⚠️ Disclaimer
 
-This project is licensed under the same terms as the original LRCGET (if applicable) or under the MIT License. Check individual source files for details.
+This is an independent community project and is not officially affiliated with the original LRCGET desktop project or LRCLIB.

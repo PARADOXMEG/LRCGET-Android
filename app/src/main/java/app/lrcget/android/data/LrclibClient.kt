@@ -19,8 +19,15 @@ data class LyricsLookupResult(
     val duration: Int = 0,
     val albumArtUrl: String? = null
 ) {
-    val lineCount: Int by lazy { lyrics.lines().count { it.isNotBlank() } }
+    val lineCount: Int by lazy { 
+        lyrics.lines().count { line ->
+            val content = line.replace(Regex("\\[\\d{1,2}:\\d{2}(?:[.:]\\d{1,3})?]"), "").trim()
+            content.isNotBlank()
+        }
+    }
 }
+
+data class Challenge(val prefix: String, val target: String)
 
 class LrclibClient {
     fun findLyrics(track: TrackItem, syncedOnly: Boolean): LyricsLookupResult? {
@@ -74,6 +81,91 @@ class LrclibClient {
             search.optJSONObject(i)?.lyrics(syncedOnly = false)?.let { results.add(it) }
         }
         return results
+    }
+
+    fun publishLyrics(
+        trackName: String,
+        artistName: String,
+        albumName: String,
+        duration: Int,
+        plainLyrics: String,
+        syncedLyrics: String
+    ): Result<Unit> {
+        val challenge = requestChallenge() ?: return Result.failure(Exception("Failed to request challenge from LRCLIB"))
+        val nonce = solveChallenge(challenge.prefix, challenge.target)
+        val publishToken = "${challenge.prefix}:$nonce"
+
+        val jsonBody = JSONObject().apply {
+            put("trackName", trackName)
+            put("artistName", artistName)
+            put("albumName", albumName)
+            put("duration", duration)
+            put("plainLyrics", plainLyrics)
+            put("syncedLyrics", syncedLyrics)
+        }
+
+        return post("https://lrclib.net/api/publish", jsonBody, publishToken)
+    }
+
+    private fun requestChallenge(): Challenge? {
+        val response = postRaw("https://lrclib.net/api/request-challenge", JSONObject(), null) ?: return null
+        return runCatching {
+            val json = JSONObject(response)
+            Challenge(json.getString("prefix"), json.getString("target"))
+        }.getOrNull()
+    }
+
+    private fun solveChallenge(prefix: String, target: String): String {
+        var nonce = 0L
+        val md = java.security.MessageDigest.getInstance("SHA-256")
+        while (true) {
+            val attempt = "$prefix$nonce"
+            val hash = md.digest(attempt.toByteArray()).joinToString("") { "%02x".format(it) }
+            if (hash <= target) {
+                return nonce.toString()
+            }
+            nonce++
+            if (nonce % 10000 == 0L) {
+                if (Thread.interrupted()) throw InterruptedException()
+            }
+        }
+    }
+
+    private fun post(url: String, json: JSONObject, token: String?): Result<Unit> {
+        val response = postRaw(url, json, token) ?: return Result.failure(Exception("Network error or empty response"))
+        return Result.success(Unit)
+    }
+
+    private fun postRaw(url: String, json: JSONObject, token: String?): String? {
+        val connection = (URL(url).openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            connectTimeout = 30_000
+            readTimeout = 30_000
+            doOutput = true
+            setRequestProperty("Content-Type", "application/json")
+            setRequestProperty("Accept", "application/json")
+            setRequestProperty("User-Agent", "LRCGET-Android/0.1.0")
+            if (token != null) {
+                setRequestProperty("X-Publish-Token", token)
+            }
+        }
+
+        return runCatching {
+            connection.outputStream.use { it.write(json.toString().toByteArray()) }
+            val responseCode = connection.responseCode
+            if (responseCode in 200..201) {
+                connection.inputStream.bufferedReader().use { it.readText() }
+            } else {
+                val errorBody = connection.errorStream?.bufferedReader()?.use { it.readText() }
+                android.util.Log.e("LrclibClient", "POST error $responseCode: $errorBody")
+                null
+            }
+        }.getOrElse {
+            android.util.Log.e("LrclibClient", "POST failed", it)
+            null
+        }.also {
+            connection.disconnect()
+        }
     }
 
     private fun requestJsonObject(url: String): JSONObject? {

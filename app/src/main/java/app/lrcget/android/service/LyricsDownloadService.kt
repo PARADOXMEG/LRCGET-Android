@@ -11,27 +11,56 @@ import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
+import android.util.Log
 import app.lrcget.android.MainActivity
 import app.lrcget.android.R
+import app.lrcget.android.data.LyricsLookupResult
 import app.lrcget.android.data.MusicLibraryRepository
 import app.lrcget.android.model.DownloadMode
 import app.lrcget.android.model.LyricsOutputMode
 import app.lrcget.android.model.LyricsStatus
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONObject
+import java.io.File
+
+sealed class DownloadProgress {
+    data class Scanning(val current: Int, val total: Int) : DownloadProgress()
+    data class Processing(
+        val trackId: String, 
+        val current: Int, 
+        val total: Int, 
+        val trackTitle: String, 
+        val status: LyricsStatus, 
+        val message: String,
+        val isExport: Boolean,
+        val lyrics: app.lrcget.android.data.LyricsLookupResult? = null
+    ) : DownloadProgress()
+    data class Done(val saved: Int, val missing: Int, val skipped: Int, val failed: Int, val isExport: Boolean) : DownloadProgress()
+    data class Error(val message: String) : DownloadProgress()
+}
 
 class LyricsDownloadService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private lateinit var notificationManager: NotificationManager
+    private lateinit var powerManager: PowerManager
+    private var wakeLock: PowerManager.WakeLock? = null
     private var activeJob: Job? = null
 
     override fun onCreate() {
         super.onCreate()
         notificationManager = getSystemService(NotificationManager::class.java)
+        powerManager = getSystemService(PowerManager::class.java)
         createNotificationChannel()
     }
 
@@ -53,10 +82,25 @@ class LyricsDownloadService : Service() {
 
         val notificationTitle = if (isExport) "Exporting lyrics" else "Finding lyrics"
         startForegroundCompat(buildNotification(notificationTitle, 0, 0, true))
+        
         activeJob?.cancel()
         activeJob = scope.launch {
-            runDownload(rootUri, downloadMode, outputModes, searchDelay, isExport)
-            stopSelf(startId)
+            try {
+                acquireWakeLock()
+                runDownload(rootUri, downloadMode, outputModes, searchDelay, isExport)
+            } catch (e: Exception) {
+                if (e !is CancellationException) {
+                    Log.e("LyricsDownloadService", "Download failed", e)
+                    _progressFlow.emit(DownloadProgress.Error(e.localizedMessage ?: "Unknown error"))
+                    notificationManager.notify(
+                        notificationId(),
+                        buildNotification("Download failed: ${e.localizedMessage ?: "Unknown error"}", 0, 0, false)
+                    )
+                }
+            } finally {
+                releaseWakeLock()
+                stopSelf(startId)
+            }
         }
 
         return START_REDELIVER_INTENT
@@ -67,7 +111,23 @@ class LyricsDownloadService : Service() {
     override fun onDestroy() {
         activeJob?.cancel()
         scope.cancel()
+        releaseWakeLock()
         super.onDestroy()
+    }
+
+    private fun acquireWakeLock() {
+        if (wakeLock?.isHeld == true) return
+        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "LRCGET:DownloadWakeLock").apply {
+            // Set a timeout of 30 minutes just in case
+            acquire(30 * 60 * 1000L)
+        }
+    }
+
+    private fun releaseWakeLock() {
+        if (wakeLock?.isHeld == true) {
+            wakeLock?.release()
+        }
+        wakeLock = null
     }
 
     private suspend fun runDownload(
@@ -78,14 +138,49 @@ class LyricsDownloadService : Service() {
         isExport: Boolean
     ) {
         val repository = MusicLibraryRepository(this)
-        val initialTitle = if (isExport) "Preparing export" else "Scanning music folder"
-        notificationManager.notify(notificationId(), buildNotification(initialTitle, 0, 0, true))
         
-        val tracks = repository.scan(rootUri) { current, total ->
-            notificationManager.notify(
-                notificationId(), 
-                buildNotification("Scanning music files", current, total, false)
-            )
+        // Load exported lyrics if they exist
+        val exportedLyrics = if (isExport) {
+            try {
+                val file = File(filesDir, "export_lyrics.json")
+                if (file.exists()) {
+                    val json = JSONObject(file.readText())
+                    val map = mutableMapOf<String, LyricsLookupResult>()
+                    json.keys().forEach { id ->
+                        val obj = json.getJSONObject(id)
+                        map[id] = LyricsLookupResult(
+                            lyrics = obj.getString("lyrics"),
+                            isSynced = obj.getBoolean("isSynced"),
+                            isInstrumental = obj.getBoolean("isInstrumental"),
+                            trackName = obj.optString("trackName"),
+                            artistName = obj.optString("artistName"),
+                            albumName = obj.optString("albumName"),
+                            duration = obj.optInt("duration")
+                        )
+                    }
+                    file.delete() // Clean up after reading
+                    map
+                } else null
+            } catch (e: Exception) {
+                Log.e("LyricsDownloadService", "Failed to load exported lyrics", e)
+                null
+            }
+        } else null
+
+        // Try to use cached tracks first to avoid redundant scanning
+        var tracks = repository.loadTracks(rootUri)
+        
+        if (tracks.isEmpty()) {
+            val initialTitle = if (isExport) "Preparing export" else "Scanning music folder"
+            notificationManager.notify(notificationId(), buildNotification(initialTitle, 0, 0, true))
+            
+            tracks = repository.scan(rootUri) { current, total ->
+                scope.launch { _progressFlow.emit(DownloadProgress.Scanning(current, total)) }
+                notificationManager.notify(
+                    notificationId(), 
+                    buildNotification("Scanning music files", current, total, false)
+                )
+            }
         }
 
         if (tracks.isEmpty()) {
@@ -94,6 +189,16 @@ class LyricsDownloadService : Service() {
         }
         
         val tracksToProcess = tracks.filter { track ->
+            if (isExport) {
+                // For export, ONLY process tracks that were successfully found in this session
+                return@filter exportedLyrics?.containsKey(track.id) == true
+            }
+
+            // Skip tracks that already have a result if we are just finding online
+            if (track.status == LyricsStatus.Found || track.status == LyricsStatus.Saved) {
+                return@filter false
+            }
+            
             when (downloadMode) {
                 DownloadMode.All -> true
                 DownloadMode.MissingSynced -> !track.hasSyncedLyrics
@@ -105,42 +210,107 @@ class LyricsDownloadService : Service() {
         var missing = 0
         var skipped = 0
         var failed = 0
+        var currentTrackIndex = -1
 
-        tracksToProcess.forEachIndexed { index, track ->
-            val trackAction = if (isExport) "Saving" else "Finding"
-            notificationManager.notify(
-                notificationId(),
-                buildNotification("$trackAction ${track.title}", index + 1, tracksToProcess.size, false)
-            )
+        try {
+            tracksToProcess.forEachIndexed { index, track ->
+                currentTrackIndex = index
+                val trackAction = if (isExport) "Saving" else "Finding"
+                notificationManager.notify(
+                    notificationId(),
+                    buildNotification("$trackAction ${track.title}", index + 1, tracksToProcess.size, false)
+                )
 
-            val status = if (isExport) {
-                val lyrics = repository.getLyricsResultForTrack(track)
-                if (lyrics != null) {
-                    repository.saveManualLyrics(track, lyrics, true, outputModes).status
+                // Emit "Downloading" status while searching/saving
+                _progressFlow.emit(
+                    DownloadProgress.Processing(
+                        track.id,
+                        index + 1,
+                        tracksToProcess.size,
+                        track.title,
+                        LyricsStatus.Downloading,
+                        if (isExport) "Saving..." else "Searching...",
+                        isExport,
+                        null
+                    )
+                )
+
+                val lyrics = if (isExport) {
+                    exportedLyrics?.get(track.id)
                 } else {
-                    LyricsStatus.Missing
+                    repository.getLyricsResultForTrack(track)
                 }
-            } else {
-                val lyrics = repository.getLyricsResultForTrack(track)
-                if (lyrics != null) LyricsStatus.Found else LyricsStatus.Missing
-            }
+                
+                val status: LyricsStatus
+                val message: String
 
-            when (status) {
-                LyricsStatus.Saved, LyricsStatus.Found -> saved += 1
-                LyricsStatus.Missing -> missing += 1
-                LyricsStatus.Skipped -> skipped += 1
-                LyricsStatus.Failed -> failed += 1
-                else -> Unit
-            }
+                if (isExport) {
+                    if (lyrics != null) {
+                        val result = repository.saveManualLyrics(track, lyrics, true, outputModes)
+                        status = result.status
+                        message = result.message
+                    } else {
+                        status = LyricsStatus.Missing
+                        message = "No lyrics fetched"
+                    }
+                } else {
+                    if (lyrics != null) {
+                        status = LyricsStatus.Found
+                        message = when {
+                            lyrics.isInstrumental -> "Instrumental found"
+                            lyrics.isSynced -> "Synced found"
+                            else -> "Plain found"
+                        }
+                    } else {
+                        status = LyricsStatus.Missing
+                        message = "Not found"
+                    }
+                }
 
-            if (index < (tracksToProcess.size - 1)) {
-                kotlinx.coroutines.delay(searchDelay * 1000L)
+                _progressFlow.emit(DownloadProgress.Processing(track.id, index + 1, tracksToProcess.size, track.title, status, message, isExport, lyrics))
+
+                when (status) {
+                    LyricsStatus.Saved, LyricsStatus.Found -> saved += 1
+                    LyricsStatus.Missing -> missing += 1
+                    LyricsStatus.Skipped -> skipped += 1
+                    LyricsStatus.Failed -> failed += 1
+                    else -> Unit
+                }
+
+                if (index < (tracksToProcess.size - 1)) {
+                    kotlinx.coroutines.delay(searchDelay * 1000L)
+                }
             }
+        } catch (e: CancellationException) {
+            withContext(NonCancellable) {
+                if (currentTrackIndex != -1 && currentTrackIndex < tracksToProcess.size) {
+                    val track = tracksToProcess[currentTrackIndex]
+                    _progressFlow.emit(
+                        DownloadProgress.Processing(
+                            track.id,
+                            currentTrackIndex + 1,
+                            tracksToProcess.size,
+                            track.title,
+                            LyricsStatus.Ready,
+                            "Search stopped",
+                            isExport,
+                            null
+                        )
+                    )
+                }
+            }
+            throw e
         }
 
-        val summaryPrefix = if (isExport) "Saved" else "Found"
-        val summary = "$summaryPrefix $saved, missing $missing, skipped $skipped, failed $failed"
-        notificationManager.notify(notificationId(), buildNotification(summary, tracksToProcess.size, tracksToProcess.size, false))
+        val totalToProcess = tracksToProcess.size
+        val summary = if (isExport) {
+            "Saved $saved out of $totalToProcess lyrics"
+        } else {
+            "Found $saved out of $totalToProcess lyrics, ready to export"
+        }
+        
+        _progressFlow.emit(DownloadProgress.Done(saved, missing, skipped, failed, isExport))
+        notificationManager.notify(notificationId(), buildNotification(summary, totalToProcess, totalToProcess, false))
     }
 
     private fun startForegroundCompat(notification: Notification) {
@@ -184,6 +354,9 @@ class LyricsDownloadService : Service() {
     }
 
     companion object {
+        private val _progressFlow = MutableSharedFlow<DownloadProgress>(extraBufferCapacity = 10)
+        val progressFlow = _progressFlow.asSharedFlow()
+
         private const val CHANNEL_ID = "lyrics_downloads"
         private const val NOTIFICATION_ID = 1001
         private const val EXTRA_ROOT_URI = "root_uri"

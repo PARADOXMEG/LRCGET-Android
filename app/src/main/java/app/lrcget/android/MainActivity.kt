@@ -2,13 +2,16 @@ package app.lrcget.android
 
 import android.Manifest
 import android.app.Activity
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
-import android.net.Uri
+import android.content.IntentFilter
 import android.os.Bundle
 import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.viewModels
 import androidx.activity.compose.PredictiveBackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -20,14 +23,11 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.interaction.collectIsDraggedAsState
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
-import androidx.compose.animation.core.animateDpAsState
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
@@ -45,6 +45,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.material3.dynamicDarkColorScheme
 import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
@@ -109,12 +110,30 @@ import kotlinx.coroutines.launch
 import kotlin.math.abs
 
 class MainActivity : ComponentActivity() {
+    private val viewModel: MainViewModel by viewModels()
+
+    private val playbackReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action == "app.lrcget.android.ACTION_PLAY_PAUSE") {
+                viewModel.state.value.previewTrack?.let { viewModel.toggleAudio(it) }
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        
+        val filter = IntentFilter("app.lrcget.android.ACTION_PLAY_PAUSE")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(playbackReceiver, filter, RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(playbackReceiver, filter)
+        }
+
         WindowCompat.setDecorFitsSystemWindows(window, false)
         enableHighRefreshRate()
         setContent {
-            val viewModel: MainViewModel = viewModel()
             val state by viewModel.state.collectAsState()
             LrcgetTheme(
                 themeMode = state.themeMode,
@@ -123,6 +142,11 @@ class MainActivity : ComponentActivity() {
                 MainScreen(viewModel)
             }
         }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        runCatching { unregisterReceiver(playbackReceiver) }
     }
 
     private fun enableHighRefreshRate() {
@@ -187,7 +211,9 @@ private fun LrcgetTheme(
     if (!view.isInEditMode) {
         LaunchedEffect(darkTheme) {
             val window = (context as Activity).window
+            @Suppress("DEPRECATION")
             window.statusBarColor = Color.Transparent.toArgb()
+            @Suppress("DEPRECATION")
             window.navigationBarColor = Color.Transparent.toArgb()
             val insetsController = WindowCompat.getInsetsController(window, view)
             insetsController.isAppearanceLightStatusBars = !darkTheme
@@ -205,9 +231,7 @@ private fun MainScreen(viewModel: MainViewModel) {
     val context = LocalContext.current
     val configuration = LocalConfiguration.current
     val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
-    val scope = rememberCoroutineScope()
-    val pagerState = rememberPagerState(initialPage = 0, pageCount = { 3 })
-    val isDragged by pagerState.interactionSource.collectIsDraggedAsState()
+    val pagerState = rememberPagerState(initialPage = 0, pageCount = { 4 })
     
     var isSearchVisible by remember { mutableStateOf(false) }
     val focusRequester = remember { FocusRequester() }
@@ -215,9 +239,6 @@ private fun MainScreen(viewModel: MainViewModel) {
     // Track if any text field is focused to disable pager swiping
     var isTextFieldFocused by remember { mutableStateOf(false) }
 
-    val filteredTracks = remember(state.tracks, state.searchQuery, state.filterStatus) {
-        state.filteredTracks
-    }
     val savedCount = remember(state.tracks) { state.savedCount }
     val missingCount = remember(state.tracks) { state.missingCount }
 
@@ -227,9 +248,9 @@ private fun MainScreen(viewModel: MainViewModel) {
         }
     }
 
-    LaunchedEffect(pagerState.currentPage) {
-        if (isDragged && state.selectedTab != pagerState.currentPage) {
-            viewModel.setSelectedTab(pagerState.currentPage)
+    LaunchedEffect(pagerState.settledPage) {
+        if (state.selectedTab != pagerState.settledPage) {
+            viewModel.setSelectedTab(pagerState.settledPage)
         }
     }
 
@@ -241,9 +262,7 @@ private fun MainScreen(viewModel: MainViewModel) {
             } else if (isSearchVisible) {
                 isSearchVisible = false
                 viewModel.setSearchQuery("")
-            } else if (state.selectedTab == 2) {
-                viewModel.setSelectedTab(if (state.previousTab == 2) 0 else state.previousTab)
-            } else {
+            } else if (state.selectedTab != 0) {
                 viewModel.setSelectedTab(0)
             }
         } catch (_: CancellationException) {
@@ -363,7 +382,13 @@ private fun MainScreen(viewModel: MainViewModel) {
                             Text("${state.selectedTrackIds.size} selected")
                         } else {
                             Text(
-                                text = if (state.selectedTab == 2) "Settings" else "LRCGET",
+                                text = when (state.selectedTab) {
+                                    0 -> "LRCGET"
+                                    1 -> "LRCLIB"
+                                    2 -> "Contribute"
+                                    3 -> "Settings"
+                                    else -> "LRCGET"
+                                },
                                 style = MaterialTheme.typography.titleLarge,
                                 fontWeight = FontWeight.SemiBold
                             )
@@ -388,6 +413,41 @@ private fun MainScreen(viewModel: MainViewModel) {
                             if (state.selectedTab == 0) {
                                 IconButton(onClick = { isSearchVisible = true }) {
                                     Icon(Icons.Default.Search, contentDescription = "Search")
+                                }
+                                
+                                var showFilterMenu by remember { mutableStateOf(false) }
+                                Box {
+                                    IconButton(onClick = { showFilterMenu = true }) {
+                                        Icon(
+                                            Icons.Default.FilterAlt,
+                                            contentDescription = "Filter",
+                                            tint = if (state.filterMode != TrackFilter.All) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
+                                        )
+                                    }
+                                    DropdownMenu(
+                                        expanded = showFilterMenu,
+                                        onDismissRequest = { showFilterMenu = false },
+                                        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh
+                                    ) {
+                                        TrackFilter.entries.forEach { mode ->
+                                            DropdownMenuItem(
+                                                text = { 
+                                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                                        RadioButton(
+                                                            selected = state.filterMode == mode,
+                                                            onClick = null
+                                                        )
+                                                        Spacer(Modifier.width(8.dp))
+                                                        Text(mode.label()) 
+                                                    }
+                                                },
+                                                onClick = {
+                                                    viewModel.setFilterMode(mode)
+                                                    showFilterMenu = false
+                                                }
+                                            )
+                                        }
+                                    }
                                 }
                             }
                             if (state.isDownloadingAll && !state.showDownloadProgress) {
@@ -429,6 +489,12 @@ private fun MainScreen(viewModel: MainViewModel) {
                 NavigationBarItem(
                     selected = pagerState.currentPage == 2,
                     onClick = { viewModel.setSelectedTab(2) },
+                    icon = { Icon(Icons.Default.CloudUpload, null) },
+                    label = { Text("Contribute") }
+                )
+                NavigationBarItem(
+                    selected = pagerState.currentPage == 3,
+                    onClick = { viewModel.setSelectedTab(3) },
                     icon = { Icon(Icons.Default.Settings, null) },
                     label = { Text("Settings") }
                 )
@@ -476,6 +542,7 @@ private fun MainScreen(viewModel: MainViewModel) {
                                             ActionPanel(
                                                 tracksSize = state.tracks.size,
                                                 savedCount = savedCount,
+                                                foundCount = state.foundGlobalCount,
                                                 missingCount = missingCount,
                                                 isBusy = state.isBusy,
                                                 isDownloadingAll = state.isDownloadingAll,
@@ -491,16 +558,70 @@ private fun MainScreen(viewModel: MainViewModel) {
                                                     }
                                                 }
                                             )
-
-                                            FilterStatusRow(
-                                                selectedStatus = state.filterStatus,
-                                                onStatusSelect = viewModel::setFilterStatus
-                                            )
                                         }
 
-                                        val tracks = filteredTracks
-                                        LazyColumn(
+                                        val tracks = state.filteredTracks
+                                        PullToRefreshBox(
                                             modifier = Modifier.weight(0.6f),
+                                            isRefreshing = state.isBusy && state.operationTotal == 0 && state.message.contains("Scanning"),
+                                            onRefresh = viewModel::scan
+                                        ) {
+                                            LazyColumn(
+                                                modifier = Modifier.fillMaxSize(),
+                                                verticalArrangement = Arrangement.spacedBy(8.dp),
+                                                contentPadding = PaddingValues(bottom = 16.dp)
+                                            ) {
+                                                items(
+                                                    items = tracks,
+                                                    key = { it.id },
+                                                    contentType = { "track" }
+                                                ) { track ->
+                                                    TrackRow(
+                                                        track = track,
+                                                        isSelected = state.selectedTrackIds.contains(track.id),
+                                                        isAnySelected = state.selectedTrackIds.isNotEmpty(),
+                                                        isPlaying = state.isPlaying && state.playingTrackId == track.id,
+                                                        isProcessing = state.processingTrackId == track.id,
+                                                        onToggleSelection = { viewModel.toggleTrackSelection(track.id) },
+                                                        onPreview = viewModel::previewLyrics,
+                                                        onDownload = viewModel::downloadTrack,
+                                                        onTogglePlay = { viewModel.toggleAudio(track) }
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        ActionPanel(
+                                            tracksSize = state.tracks.size,
+                                            savedCount = savedCount,
+                                            foundCount = state.foundGlobalCount,
+                                            missingCount = missingCount,
+                                            isBusy = state.isBusy,
+                                            isDownloadingAll = state.isDownloadingAll,
+                                            hasLibrary = state.libraryUri != null,
+                                            message = state.message,
+                                            operationProgress = state.operationProgress,
+                                            operationTotal = state.operationTotal,
+                                            onChooseFolder = { folderPicker.launch(null) },
+                                            onScan = viewModel::scan,
+                                            onDownload = {
+                                                if (state.libraryUri != null) {
+                                                    viewModel.downloadAll()
+                                                }
+                                            }
+                                        )
+                                    }
+
+                                    val tracks = state.filteredTracks
+                                    PullToRefreshBox(
+                                        modifier = Modifier.weight(1f),
+                                        isRefreshing = state.isBusy && state.operationTotal == 0 && state.message.contains("Scanning"),
+                                        onRefresh = viewModel::scan
+                                    ) {
+                                        LazyColumn(
+                                            modifier = Modifier.fillMaxSize(),
                                             verticalArrangement = Arrangement.spacedBy(8.dp),
                                             contentPadding = PaddingValues(bottom = 16.dp)
                                         ) {
@@ -523,57 +644,6 @@ private fun MainScreen(viewModel: MainViewModel) {
                                             }
                                         }
                                     }
-                                } else {
-                                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                                        ActionPanel(
-                                            tracksSize = state.tracks.size,
-                                            savedCount = savedCount,
-                                            missingCount = missingCount,
-                                            isBusy = state.isBusy,
-                                            isDownloadingAll = state.isDownloadingAll,
-                                            hasLibrary = state.libraryUri != null,
-                                            message = state.message,
-                                            operationProgress = state.operationProgress,
-                                            operationTotal = state.operationTotal,
-                                            onChooseFolder = { folderPicker.launch(null) },
-                                            onScan = viewModel::scan,
-                                            onDownload = {
-                                                if (state.libraryUri != null) {
-                                                    viewModel.downloadAll()
-                                                }
-                                            }
-                                        )
-
-                                        FilterStatusRow(
-                                            selectedStatus = state.filterStatus,
-                                            onStatusSelect = viewModel::setFilterStatus
-                                        )
-                                    }
-
-                                    val tracks = filteredTracks
-                                    LazyColumn(
-                                        modifier = Modifier.weight(1f),
-                                        verticalArrangement = Arrangement.spacedBy(8.dp),
-                                        contentPadding = PaddingValues(bottom = 16.dp)
-                                    ) {
-                                        items(
-                                            items = tracks,
-                                            key = { it.id },
-                                            contentType = { "track" }
-                                        ) { track ->
-                                            TrackRow(
-                                                track = track,
-                                                isSelected = state.selectedTrackIds.contains(track.id),
-                                                isAnySelected = state.selectedTrackIds.isNotEmpty(),
-                                                isPlaying = state.isPlaying && state.playingTrackId == track.id,
-                                                isProcessing = state.processingTrackId == track.id,
-                                                onToggleSelection = { viewModel.toggleTrackSelection(track.id) },
-                                                onPreview = viewModel::previewLyrics,
-                                                onDownload = viewModel::downloadTrack,
-                                                onTogglePlay = { viewModel.toggleAudio(track) }
-                                            )
-                                        }
-                                    }
                                 }
                             }
 
@@ -586,9 +656,6 @@ private fun MainScreen(viewModel: MainViewModel) {
                                         isDownloadingAll = state.isDownloadingAll,
                                         onQueryChange = viewModel::setManualSearchQuery,
                                         onSearch = viewModel::searchLyricsManual,
-                                        onDownload = { lyrics, track ->
-                                            viewModel.downloadManualLyrics(lyrics, track)
-                                        },
                                         onSaveToLocation = { result ->
                                             viewModel.selectPreviewLyrics(result.lyrics)
                                             lrcSaver.launch("${result.artistName} - ${result.trackName}.lrc")
@@ -600,6 +667,18 @@ private fun MainScreen(viewModel: MainViewModel) {
                             }
 
                             2 -> {
+                                Box(modifier = Modifier.weight(1f)) {
+                                    ContributePanel(
+                                        isPublishing = state.isPublishing,
+                                        publishStatus = state.publishStatus,
+                                        onPublish = viewModel::publishLyrics,
+                                        onClearStatus = viewModel::clearPublishStatus,
+                                        onFocusChange = { isTextFieldFocused = it }
+                                    )
+                                }
+                            }
+
+                            3 -> {
                                 Box(modifier = Modifier.weight(1f)) {
                                     SettingsPanel(
                                         state = state,
@@ -644,9 +723,11 @@ private fun MainScreen(viewModel: MainViewModel) {
                     track = state.previewTrack,
                     results = state.previewResults,
                     previewLyrics = state.previewLyrics,
-                    isBusy = state.isBusy,
+                    isBusy = state.isPreviewLoading,
                     isPlaying = state.isPlaying && state.playingTrackId == state.previewTrack?.id,
                     playbackPositionMs = state.playbackPositionMs,
+                    playbackDurationMs = state.playbackDurationMs,
+                    onSeek = viewModel::seekTo,
                     onSearch = viewModel::searchLyricsForPreview,
                     onSearchFieldFocusChange = { isTextFieldFocused = it },
                     onSave = { lyrics ->
@@ -663,36 +744,6 @@ private fun MainScreen(viewModel: MainViewModel) {
     }
 }
 
-@Composable
-private fun FilterStatusRow(
-    selectedStatus: LyricsStatus?,
-    onStatusSelect: (LyricsStatus?) -> Unit
-) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        val filters = listOf(
-            null to "All",
-            LyricsStatus.Saved to "Saved",
-            LyricsStatus.Missing to "Missing",
-            LyricsStatus.Ready to "Not Checked"
-        )
-
-        filters.forEach { (status, label) ->
-            FilterChip(
-                selected = selectedStatus == status,
-                onClick = { onStatusSelect(status) },
-                label = { Text(label) },
-                colors = FilterChipDefaults.filterChipColors(
-                    selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
-                    selectedLabelColor = MaterialTheme.colorScheme.onPrimaryContainer
-                )
-            )
-        }
-    }
-}
 
 @Composable
 private fun DownloadProgressDialog(
@@ -703,8 +754,10 @@ private fun DownloadProgressDialog(
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
+        containerColor = MaterialTheme.colorScheme.surface,
+        tonalElevation = 0.dp,
         title = {
-            val title = if (state.message.contains("Exporting")) "Exporting Lyrics" else "Finding Lyrics"
+            val title = if (state.isExporting) "Exporting Lyrics" else "Finding Lyrics"
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -790,6 +843,7 @@ private fun DownloadProgressDialog(
 private fun ActionPanel(
     tracksSize: Int,
     savedCount: Int,
+    foundCount: Int,
     missingCount: Int,
     isBusy: Boolean,
     isDownloadingAll: Boolean,
@@ -893,13 +947,23 @@ private fun ActionPanel(
                         style = MaterialTheme.typography.labelLarge,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
-                    if (missingCount > 0) {
-                        Text(
-                            text = "$missingCount missing",
-                            style = MaterialTheme.typography.labelLarge,
-                            color = MaterialTheme.colorScheme.error,
-                            fontWeight = FontWeight.Medium
-                        )
+                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        if (foundCount > 0) {
+                            Text(
+                                text = "$foundCount found",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = MaterialTheme.colorScheme.primary,
+                                fontWeight = FontWeight.Medium
+                            )
+                        }
+                        if (missingCount > 0) {
+                            Text(
+                                text = "$missingCount missing",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = MaterialTheme.colorScheme.error,
+                                fontWeight = FontWeight.Medium
+                            )
+                        }
                     }
                 }
             }
@@ -1040,11 +1104,176 @@ private fun TrackRow(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun ContributePanel(
+    isPublishing: Boolean,
+    publishStatus: String?,
+    onPublish: (String, String, String, Int, String, String) -> Unit,
+    onClearStatus: () -> Unit,
+    onFocusChange: (Boolean) -> Unit = {}
+) {
+    var trackName by remember { mutableStateOf(TextFieldValue("")) }
+    var artistName by remember { mutableStateOf(TextFieldValue("")) }
+    var albumName by remember { mutableStateOf(TextFieldValue("")) }
+    var durationStr by remember { mutableStateOf(TextFieldValue("")) }
+    var plainLyrics by remember { mutableStateOf(TextFieldValue("")) }
+    var syncedLyrics by remember { mutableStateOf(TextFieldValue("")) }
+
+    val trackFocused = remember { mutableStateOf(false) }
+    val artistFocused = remember { mutableStateOf(false) }
+    val albumFocused = remember { mutableStateOf(false) }
+    val durationFocused = remember { mutableStateOf(false) }
+    val plainFocused = remember { mutableStateOf(false) }
+    val syncedFocused = remember { mutableStateOf(false) }
+
+    val updateFocus = {
+        onFocusChange(trackFocused.value || artistFocused.value || albumFocused.value || 
+                     durationFocused.value || plainFocused.value || syncedFocused.value)
+    }
+
+    if (publishStatus != null) {
+        AlertDialog(
+            onDismissRequest = onClearStatus,
+            title = { Text(if (publishStatus.contains("Success")) "Success" else "Publishing Status") },
+            text = { Text(publishStatus) },
+            confirmButton = {
+                TextButton(onClick = onClearStatus) { Text("OK") }
+            }
+        )
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(
+            "Contribute to LRCLIB",
+            style = MaterialTheme.typography.headlineSmall,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.padding(top = 8.dp)
+        )
+        Text(
+            "Share lyrics with the community. No registration required.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center
+        )
+
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+            CursorScrollableTextField(
+                value = trackName,
+                onValueChange = { trackName = it },
+                label = "Track Name *",
+                placeholder = "e.g. Bohemian Rhapsody",
+                modifier = Modifier.fillMaxWidth().onFocusChanged { trackFocused.value = it.isFocused; updateFocus() },
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next)
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                CursorScrollableTextField(
+                    value = artistName,
+                    onValueChange = { artistName = it },
+                    label = "Artist Name *",
+                    placeholder = "e.g. Queen",
+                    modifier = Modifier.weight(1f).onFocusChanged { artistFocused.value = it.isFocused; updateFocus() },
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next)
+                )
+                CursorScrollableTextField(
+                    value = albumName,
+                    onValueChange = { albumName = it },
+                    label = "Album Name *",
+                    placeholder = "e.g. A Night at the Opera",
+                    modifier = Modifier.weight(1f).onFocusChanged { albumFocused.value = it.isFocused; updateFocus() },
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next)
+                )
+            }
+            CursorScrollableTextField(
+                value = durationStr,
+                onValueChange = { newValue ->
+                    val filtered = newValue.text.filter { !it.isLetter() }
+                    durationStr = if (filtered == newValue.text) newValue else newValue.copy(text = filtered)
+                },
+                label = "Duration (seconds) *",
+                placeholder = "e.g. 354",
+                modifier = Modifier.fillMaxWidth().onFocusChanged { durationFocused.value = it.isFocused; updateFocus() },
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next)
+            )
+        }
+
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+            Text("Lyrics", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            
+            Box(modifier = Modifier.height(200.dp)) {
+                CursorScrollableTextField(
+                    value = plainLyrics,
+                    onValueChange = { plainLyrics = it },
+                    label = "Plain Lyrics",
+                    placeholder = "Paste plain text lyrics here...",
+                    modifier = Modifier.fillMaxSize().onFocusChanged { plainFocused.value = it.isFocused; updateFocus() },
+                    shape = MaterialTheme.shapes.medium,
+                    lineLimits = TextFieldLineLimits.MultiLine(minHeightInLines = 5)
+                )
+            }
+
+            Box(modifier = Modifier.height(200.dp)) {
+                CursorScrollableTextField(
+                    value = syncedLyrics,
+                    onValueChange = { syncedLyrics = it },
+                    label = "Synced Lyrics (LRC)",
+                    placeholder = "[00:12.34] Timed lyrics here...",
+                    modifier = Modifier.fillMaxSize().onFocusChanged { syncedFocused.value = it.isFocused; updateFocus() },
+                    shape = MaterialTheme.shapes.medium,
+                    lineLimits = TextFieldLineLimits.MultiLine(minHeightInLines = 5)
+                )
+            }
+        }
+
+        Button(
+            onClick = {
+                val duration = durationStr.text.toIntOrNull() ?: 0
+                onPublish(
+                    trackName.text,
+                    artistName.text,
+                    albumName.text,
+                    duration,
+                    plainLyrics.text,
+                    syncedLyrics.text
+                )
+            },
+            modifier = Modifier.fillMaxWidth().height(56.dp),
+            enabled = !isPublishing && trackName.text.isNotBlank() && artistName.text.isNotBlank() && 
+                      albumName.text.isNotBlank() && durationStr.text.isNotBlank(),
+            shape = MaterialTheme.shapes.large
+        ) {
+            if (isPublishing) {
+                CircularProgressIndicator(modifier = Modifier.size(24.dp), color = MaterialTheme.colorScheme.onPrimary)
+                Spacer(Modifier.width(12.dp))
+                Text("Publishing...")
+            } else {
+                Icon(Icons.Default.CloudUpload, null)
+                Spacer(Modifier.width(12.dp))
+                Text("Publish to LRCLIB")
+            }
+        }
+
+        Spacer(modifier = Modifier.height(32.dp))
+    }
+}
+
 @Composable
 private fun StatusBadge(text: String, forceColor: Pair<Color, Color>? = null) {
     val (containerColor, contentColor) = forceColor ?: when {
+        text.contains("Searching", ignoreCase = true) || text.contains("Saving...", ignoreCase = true) ->
+            MaterialTheme.colorScheme.primary to Color.White
+        text.contains("Search stopped", ignoreCase = true) ->
+            MaterialTheme.colorScheme.surfaceVariant to MaterialTheme.colorScheme.onSurfaceVariant
         text.contains("synced", ignoreCase = true) -> 
             MaterialTheme.colorScheme.primaryContainer to MaterialTheme.colorScheme.onPrimaryContainer
+        text.contains("instrumental", ignoreCase = true) -> 
+            MaterialTheme.colorScheme.secondaryContainer to MaterialTheme.colorScheme.onSecondaryContainer
         text.contains("LRC", ignoreCase = true) -> 
             MaterialTheme.colorScheme.tertiaryContainer to MaterialTheme.colorScheme.onTertiaryContainer
         text.contains("plain", ignoreCase = true) || text.contains("Text", ignoreCase = true) -> 
@@ -1080,14 +1309,11 @@ private fun ManualSearchPanel(
     isDownloadingAll: Boolean,
     onQueryChange: (String) -> Unit,
     onSearch: (String, String, String) -> Unit,
-    onDownload: (LyricsLookupResult, TrackItem) -> Unit,
     onSaveToLocation: (LyricsLookupResult) -> Unit,
     onShare: (String, String, String) -> Unit,
     onFocusChange: (Boolean) -> Unit = {}
 ) {
     var previewResult by remember { mutableStateOf<LyricsLookupResult?>(null) }
-    var selectedShareLines by remember { mutableStateOf(setOf<Int>()) }
-    var showShareDialog by remember { mutableStateOf(false) }
     
     var isFocusedInternal by remember { mutableStateOf(false) }
 
@@ -1123,12 +1349,6 @@ private fun ManualSearchPanel(
                         fontWeight = FontWeight.Bold,
                         textAlign = TextAlign.Center
                     )
-                    Text(
-                        text = "To search for a specific track now, use the preview icon in the Tracks tab.",
-                        style = MaterialTheme.typography.bodyMedium,
-                        textAlign = TextAlign.Center,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
                 }
             }
         }
@@ -1143,7 +1363,6 @@ private fun ManualSearchPanel(
         AlertDialog(
             onDismissRequest = { 
                 previewResult = null
-                selectedShareLines = emptySet()
             },
             containerColor = MaterialTheme.colorScheme.surface,
             tonalElevation = 0.dp,
@@ -1157,16 +1376,8 @@ private fun ManualSearchPanel(
                         text = "${previewResult!!.artistName} - ${previewResult!!.trackName}",
                         modifier = Modifier.weight(1f)
                     )
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        if (selectedShareLines.isNotEmpty()) {
-                            IconButton(onClick = { showShareDialog = true }) {
-                                Icon(Icons.Default.Share, contentDescription = "Share Card", tint = MaterialTheme.colorScheme.primary)
-                            }
-                        } else {
-                            IconButton(onClick = { onShare(previewResult!!.trackName, previewResult!!.artistName, previewResult!!.lyrics) }) {
-                                Icon(Icons.Default.Share, contentDescription = "Share")
-                            }
-                        }
+                    IconButton(onClick = { onShare(previewResult!!.trackName, previewResult!!.artistName, previewResult!!.lyrics) }) {
+                        Icon(Icons.Default.Share, contentDescription = "Share")
                     }
                 }
             },
@@ -1194,65 +1405,23 @@ private fun ManualSearchPanel(
                                 )
                             }
                         } else {
-                            itemsIndexed(parsedLines) { index, line ->
+                            itemsIndexed(parsedLines) { _, line ->
                                 Text(
                                     text = line.text,
                                     style = MaterialTheme.typography.bodyMedium,
                                     modifier = Modifier
                                         .fillMaxWidth()
-                                        .combinedClickable(
-                                            onClick = {
-                                                selectedShareLines =
-                                                    if (selectedShareLines.contains(index)) {
-                                                        selectedShareLines - index
-                                                    } else {
-                                                        selectedShareLines + index
-                                                    }
-                                            }
-                                        )
-                                        .background(
-                                            if (selectedShareLines.contains(index)) MaterialTheme.colorScheme.secondaryContainer.copy(
-                                                alpha = 0.5f
-                                            )
-                                            else Color.Transparent,
-                                            RoundedCornerShape(4.dp)
-                                        )
                                         .padding(horizontal = 4.dp, vertical = 2.dp)
                                 )
                             }
                         }
                     }
                 }
-
-                if (showShareDialog) {
-                    val linesToShare = if (selectedShareLines.isEmpty()) {
-                        parsedLines.take(5).map { it.text }
-                    } else {
-                        parsedLines.filterIndexed { index, _ -> selectedShareLines.contains(index) }.map { it.text }
-                    }
-                    ShareLyricsDialog(
-                        track = TrackItem(
-                            id = "manual",
-                            audioUri = Uri.EMPTY,
-                            parentUri = Uri.EMPTY,
-                            fileName = "",
-                            title = previewResult!!.trackName,
-                            artist = previewResult!!.artistName,
-                            album = previewResult!!.albumName,
-                            durationSeconds = previewResult!!.duration,
-                            lrcFileName = "",
-                            artUri = previewResult!!.albumArtUrl
-                        ),
-                        lines = linesToShare,
-                        onDismiss = { showShareDialog = false }
-                    )
-                }
             },
             confirmButton = {
                 Button(onClick = {
                     onSaveToLocation(previewResult!!)
                     previewResult = null
-                    selectedShareLines = emptySet()
                 }) {
                     Text("Save .lrc File")
                 }
@@ -1260,7 +1429,6 @@ private fun ManualSearchPanel(
             dismissButton = {
                 TextButton(onClick = { 
                     previewResult = null
-                    selectedShareLines = emptySet()
                 }) {
                     Text("Close")
                 }
@@ -1331,9 +1499,11 @@ private fun CursorScrollableTextField(
     shape: androidx.compose.ui.graphics.Shape = MaterialTheme.shapes.medium,
     textStyle: TextStyle = MaterialTheme.typography.bodyMedium,
     keyboardOptions: KeyboardOptions = KeyboardOptions.Default,
+    lineLimits: TextFieldLineLimits = TextFieldLineLimits.SingleLine,
     onKeyboardAction: (() -> Unit)? = null,
     trailingIcon: (@Composable () -> Unit)? = null
 ) {
+    var isFocused by remember { mutableStateOf(false) }
     val scrollState = rememberScrollState()
     val textFieldState = rememberTextFieldState(
         initialText = value.text,
@@ -1366,7 +1536,7 @@ private fun CursorScrollableTextField(
     }
 
     Surface(
-        modifier = modifier,
+        modifier = modifier.onFocusChanged { isFocused = it.isFocused },
         shape = shape,
         color = colors.surface,
         tonalElevation = 0.dp
@@ -1376,7 +1546,7 @@ private fun CursorScrollableTextField(
                 .border(1.dp, borderColor, shape)
                 .padding(horizontal = 14.dp, vertical = 8.dp)
                 .heightIn(min = 40.dp),
-            verticalAlignment = Alignment.CenterVertically,
+            verticalAlignment = if (lineLimits is TextFieldLineLimits.SingleLine) Alignment.CenterVertically else Alignment.Top,
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             BasicTextField(
@@ -1388,7 +1558,7 @@ private fun CursorScrollableTextField(
                 onKeyboardAction = {
                     onKeyboardAction?.invoke() ?: it()
                 },
-                lineLimits = TextFieldLineLimits.SingleLine,
+                lineLimits = lineLimits,
                 cursorBrush = SolidColor(colors.primary),
                 scrollState = scrollState,
                 decorator = { innerTextField ->
@@ -1407,7 +1577,7 @@ private fun CursorScrollableTextField(
                                 modifier = Modifier
                                     .fillMaxWidth()
                             ) {
-                                if (textFieldState.text.isEmpty() && placeholder != null) {
+                                if (isFocused && textFieldState.text.isEmpty() && placeholder != null) {
                                     Text(
                                         text = placeholder,
                                         style = textStyle,
@@ -1527,7 +1697,7 @@ private fun LazyListScope.searchResults(
             key = { index, item -> "${index}-${item.trackName}-${item.lyrics.hashCode()}" }
         ) { _, result ->
             Box(modifier = Modifier.padding(horizontal = 16.dp)) {
-                LyricsResultCard(
+                LyricsResultItem(
                     result = result,
                     trackDuration = trackDuration,
                     onPreview = onPreview,
@@ -1777,7 +1947,7 @@ private fun ExportDialog(
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
-        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+        containerColor = MaterialTheme.colorScheme.surface,
         tonalElevation = 0.dp,
         title = {
             Text(
@@ -1856,6 +2026,8 @@ private fun LyricsPreviewDialog(
     isBusy: Boolean,
     isPlaying: Boolean,
     playbackPositionMs: Int,
+    playbackDurationMs: Int,
+    onSeek: (Int) -> Unit,
     onSearch: (String, String, String) -> Unit,
     onSearchFieldFocusChange: (Boolean) -> Unit = {},
     onSave: (LyricsLookupResult) -> Unit,
@@ -1874,6 +2046,8 @@ private fun LyricsPreviewDialog(
     // Track if search fields are focused to disable parent scrolling/paging
     var areFieldsFocused by remember { mutableStateOf(false) }
 
+    var dragPosition by remember { mutableStateOf<Float?>(null) }
+
     val configuration = LocalConfiguration.current
     val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
 
@@ -1888,8 +2062,8 @@ private fun LyricsPreviewDialog(
 
     val scrollState = rememberLazyListState()
     
-    LaunchedEffect(currentLineIndex) {
-        if (currentLineIndex != -1) {
+    LaunchedEffect(currentLineIndex, selectedShareLines.isEmpty()) {
+        if (currentLineIndex != -1 && selectedShareLines.isEmpty()) {
             scrollState.animateScrollToItem(currentLineIndex, -100)
         }
     }
@@ -1925,7 +2099,7 @@ private fun LyricsPreviewDialog(
                             IconButton(onClick = {
                                 val lyrics = selectedResultForPreview?.lyrics ?: previewLyrics ?: ""
                                 val tName = selectedResultForPreview?.trackName ?: track?.title ?: "Unknown"
-                                val aName = selectedResultForPreview?.artistName ?: artist ?: "Unknown"
+                                val aName = selectedResultForPreview?.artistName ?: artist
                                 onShare(tName, aName, lyrics)
                             }) {
                                 Icon(Icons.Default.Share, contentDescription = "Share")
@@ -1971,6 +2145,42 @@ private fun LyricsPreviewDialog(
                         overflow = TextOverflow.Ellipsis
                     )
                 }
+
+                if (playbackDurationMs > 0) {
+                    val sliderPosition = dragPosition ?: playbackPositionMs.toFloat()
+                    Column(modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) {
+                        Slider(
+                            value = sliderPosition.coerceIn(0f, playbackDurationMs.toFloat()),
+                            onValueChange = { dragPosition = it },
+                            onValueChangeFinished = {
+                                dragPosition?.let { onSeek(it.toInt()) }
+                                dragPosition = null
+                            },
+                            valueRange = 0f..playbackDurationMs.toFloat(),
+                            modifier = Modifier.fillMaxWidth().height(24.dp),
+                            colors = SliderDefaults.colors(
+                                thumbColor = MaterialTheme.colorScheme.primary,
+                                activeTrackColor = MaterialTheme.colorScheme.primary,
+                                inactiveTrackColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.2f)
+                            )
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                text = formatTime(sliderPosition.toInt()),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Text(
+                                text = formatTime(playbackDurationMs),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
             }
         },
         text = {
@@ -2002,15 +2212,16 @@ private fun LyricsPreviewDialog(
 
                     Box(modifier = Modifier.weight(if (showSearchFields && selectedResultForPreview == null) 0.6f else 1f)) {
                         PreviewMainContent(
-                            selectedResultForPreview,
-                            isBusy,
-                            results,
-                            track,
-                            parsedLines,
-                            currentLineIndex,
-                            scrollState,
-                            onSave,
-                            onShare,
+                            selectedResultForPreview = selectedResultForPreview,
+                            isBusy = isBusy,
+                            results = results,
+                            track = track,
+                            parsedLines = parsedLines,
+                            currentLineIndex = currentLineIndex,
+                            scrollState = scrollState,
+                            onSave = onSave,
+                            onShare = onShare,
+                            onSeek = onSeek,
                             onResultSelect = { selectedResultForPreview = it },
                             selectedShareLines = selectedShareLines,
                             onToggleShareLine = { index ->
@@ -2045,15 +2256,16 @@ private fun LyricsPreviewDialog(
                     }
 
                     PreviewMainContent(
-                        selectedResultForPreview,
-                        isBusy,
-                        results,
-                        track,
-                        parsedLines,
-                        currentLineIndex,
-                        scrollState,
-                        onSave,
-                        onShare,
+                        selectedResultForPreview = selectedResultForPreview,
+                        isBusy = isBusy,
+                        results = results,
+                        track = track,
+                        parsedLines = parsedLines,
+                        currentLineIndex = currentLineIndex,
+                        scrollState = scrollState,
+                        onSave = onSave,
+                        onShare = onShare,
+                        onSeek = onSeek,
                         onResultSelect = { selectedResultForPreview = it },
                         selectedShareLines = selectedShareLines,
                         onToggleShareLine = { index ->
@@ -2199,6 +2411,7 @@ private fun PreviewMainContent(
     scrollState: androidx.compose.foundation.lazy.LazyListState,
     onSave: (LyricsLookupResult) -> Unit,
     onShare: (String, String, String) -> Unit,
+    onSeek: (Int) -> Unit,
     onResultSelect: (LyricsLookupResult) -> Unit,
     selectedShareLines: Set<Int> = emptySet(),
     onToggleShareLine: (Int) -> Unit = {}
@@ -2234,7 +2447,13 @@ private fun PreviewMainContent(
                         modifier = Modifier
                             .fillMaxWidth()
                             .combinedClickable(
-                                onClick = { onToggleShareLine(index) },
+                                onClick = {
+                                    if (selectedShareLines.isNotEmpty()) {
+                                        onToggleShareLine(index)
+                                    } else {
+                                        onSeek(line.timeMs)
+                                    }
+                                },
                                 onLongClick = { onToggleShareLine(index) }
                             )
                             .background(
@@ -2286,7 +2505,7 @@ private fun PreviewMainContent(
                         key = { index, result -> "${result.trackName}-${result.lyrics.hashCode()}-$index" },
                         contentType = { _, _ -> "lyrics_result" }
                     ) { _, result ->
-                        LyricsResultCard(
+                        LyricsResultItem(
                             result = result,
                             trackDuration = track?.durationSeconds ?: 0,
                             onPreview = { onResultSelect(result) },
@@ -2301,7 +2520,7 @@ private fun PreviewMainContent(
 }
 
 @Composable
-private fun LyricsResultCard(
+private fun LyricsResultItem(
     result: LyricsLookupResult,
     trackDuration: Int = 0,
     onPreview: (LyricsLookupResult) -> Unit,
@@ -2399,13 +2618,6 @@ private fun LyricsResultCard(
 }
 
 
-private fun LyricsStatus.color() = when (this) {
-    LyricsStatus.Found, LyricsStatus.Saved -> Color(0xFF2E7D32) // Green
-    LyricsStatus.Missing, LyricsStatus.Failed -> Color(0xFFC62828) // Red
-    LyricsStatus.Skipped -> Color(0xFF757575) // Gray
-    else -> Color(0xFF757575)
-}
-
 private fun LyricsStatus.label(track: TrackItem? = null): String = when (this) {
     LyricsStatus.Ready -> track?.message?.takeIf { it.isNotBlank() } ?: "Not checked"
     LyricsStatus.Found -> track?.message?.takeIf { it.isNotBlank() } ?: "Lyrics found"
@@ -2417,7 +2629,7 @@ private fun LyricsStatus.label(track: TrackItem? = null): String = when (this) {
     else -> name
 }
 
-private fun requestBatteryOptimizationExemption(context: android.content.Context) {
+private fun requestBatteryOptimizationExemption(context: Context) {
     val powerManager = context.getSystemService(PowerManager::class.java)
     if (powerManager?.isIgnoringBatteryOptimizations(context.packageName) == true) return
 
@@ -2444,13 +2656,20 @@ private fun TextFieldValue.withSyncedText(text: String): TextFieldValue {
 private fun TextRange.coerceToTextLength(length: Int): TextRange =
     TextRange(start.coerceIn(0, length), end.coerceIn(0, length))
 
+private fun formatTime(ms: Int): String {
+    val totalSeconds = ms / 1000
+    val minutes = totalSeconds / 60
+    val seconds = totalSeconds % 60
+    return "%d:%02d".format(Locale.getDefault(), minutes, seconds)
+}
+
 private fun parseLrc(lrcText: String): List<ParsedLrcLine> {
     val tagPattern = Regex("\\[(\\d{1,2}):(\\d{2})(?:[.:](\\d{1,3}))?]")
     return lrcText.lineSequence().flatMap { rawLine ->
         val matches = tagPattern.findAll(rawLine).toList()
         val text = rawLine.replace(tagPattern, "").trim()
         if (matches.isEmpty()) {
-            emptySequence<ParsedLrcLine>()
+            emptySequence()
         } else {
             matches.asSequence().mapNotNull { match ->
                 val minutes = match.groupValues[1].toIntOrNull() ?: return@mapNotNull null
@@ -2523,6 +2742,8 @@ private fun ShareLyricsDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
+        containerColor = MaterialTheme.colorScheme.surface,
+        tonalElevation = 0.dp,
         title = { Text("Share lyrics") },
         text = {
             Column(
@@ -2563,13 +2784,13 @@ private fun ShareLyricsDialog(
                                     .clip(RoundedCornerShape(4.dp)),
                                 error = rememberVectorPainter(Icons.Default.MusicNote)
                             )
-                            Column {
+                            Column(modifier = Modifier.weight(1f)) {
                                 Text(
                                     text = track.title, 
                                     color = contentColor, 
                                     style = MaterialTheme.typography.titleMedium, 
                                     fontWeight = FontWeight.Bold, 
-                                    maxLines = 1,
+                                    maxLines = 2,
                                     overflow = TextOverflow.Ellipsis
                                 )
                                 Text(

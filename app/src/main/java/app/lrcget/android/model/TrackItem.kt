@@ -50,5 +50,5 @@ data class TrackItem(
     val hasSyncedLyrics: Boolean = false,
     val isInstrumental: Boolean = false,
     val status: LyricsStatus = LyricsStatus.Ready,
-    val message: String = ""
+    val message: String = "",
 )
