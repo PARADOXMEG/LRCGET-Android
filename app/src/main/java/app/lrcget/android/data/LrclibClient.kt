@@ -2,6 +2,8 @@ package app.lrcget.android.data
 
 import app.lrcget.android.model.TrackItem
 import androidx.compose.runtime.Immutable
+import android.util.Log
+import kotlinx.coroutines.yield
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
@@ -13,18 +15,13 @@ data class LyricsLookupResult(
     val lyrics: String,
     val isSynced: Boolean,
     val isInstrumental: Boolean,
-    val trackName: String = "",
-    val artistName: String = "",
-    val albumName: String = "",
-    val duration: Int = 0,
+    val trackName: String,
+    val artistName: String,
+    val albumName: String,
+    val duration: Int,
     val albumArtUrl: String? = null
 ) {
-    val lineCount: Int by lazy { 
-        lyrics.lines().count { line ->
-            val content = line.replace(Regex("\\[\\d{1,2}:\\d{2}(?:[.:]\\d{1,3})?]"), "").trim()
-            content.isNotBlank()
-        }
-    }
+    val lineCount: Int get() = lyrics.lines().count { it.isNotBlank() }
 }
 
 data class Challenge(val prefix: String, val target: String)
@@ -34,48 +31,39 @@ class LrclibClient {
         return findAllLyrics(track, syncedOnly).firstOrNull()
     }
 
-    fun findAllLyrics(track: TrackItem, syncedOnly: Boolean = false): List<LyricsLookupResult> {
-        val results = mutableListOf<LyricsLookupResult>()
-
-        val exact = requestJsonObject(
-            "https://lrclib.net/api/get?" + mapOf(
-                "track_name" to track.title,
-                "artist_name" to track.artist,
-                "album_name" to track.album,
-                "duration" to track.durationSeconds.toString()
-            ).toQuery()
+    fun findAllLyrics(track: TrackItem, syncedOnly: Boolean): List<LyricsLookupResult> {
+        val query = mutableMapOf(
+            "track_name" to track.title,
+            "artist_name" to track.artist,
+            "album_name" to track.album,
+            "duration" to track.durationSeconds.toString()
         )
-
-        exact?.lyrics(syncedOnly)?.let { results.add(it) }
-
-        val query = listOf(track.artist, track.title).filter { it.isNotBlank() }.joinToString(" ")
-        if (query.isNotBlank()) {
-            val search = requestJsonArray("https://lrclib.net/api/search?q=${query.urlEncoded()}")
-            if (search != null) {
-                for (i in 0 until search.length()) {
-                    search.optJSONObject(i)?.lyrics(syncedOnly)?.let { result ->
-                        if (results.none { it.lyrics == result.lyrics }) {
-                            results.add(result)
-                        }
-                    }
-                }
-            }
+        val url = "https://lrclib.net/api/get?${query.toQuery()}"
+        val response = requestJsonObject(url)
+        
+        if (response != null) {
+            val result = response.lyrics(syncedOnly)
+            if (result != null) return listOf(result)
         }
 
+        // If not found, try search
+        val searchUrl = "https://lrclib.net/api/search?${query.toQuery()}"
+        val search = requestJsonArray(searchUrl) ?: return emptyList()
+        val results = mutableListOf<LyricsLookupResult>()
+        for (i in 0 until search.length()) {
+            search.optJSONObject(i)?.lyrics(syncedOnly)?.let { results.add(it) }
+        }
         return results
     }
 
-    fun searchLyricsManual(
-        trackName: String,
-        artistName: String = "",
-        albumName: String = ""
-    ): List<LyricsLookupResult> {
-        val params = mutableMapOf("track_name" to trackName)
-        if (artistName.isNotBlank()) params["artist_name"] = artistName
-        if (albumName.isNotBlank()) params["album_name"] = albumName
-        
-        val url = "https://lrclib.net/api/search?" + params.toQuery()
-        val search = requestJsonArray(url) ?: return emptyList()
+    fun searchLyricsManual(trackName: String, artistName: String, albumName: String): List<LyricsLookupResult> {
+        val query = mutableMapOf(
+            "track_name" to trackName,
+            "artist_name" to artistName,
+            "album_name" to albumName
+        )
+        val searchUrl = "https://lrclib.net/api/search?${query.toQuery()}"
+        val search = requestJsonArray(searchUrl) ?: return emptyList()
         val results = mutableListOf<LyricsLookupResult>()
         for (i in 0 until search.length()) {
             search.optJSONObject(i)?.lyrics(syncedOnly = false)?.let { results.add(it) }
@@ -83,7 +71,7 @@ class LrclibClient {
         return results
     }
 
-    fun publishLyrics(
+    suspend fun publishLyrics(
         trackName: String,
         artistName: String,
         albumName: String,
@@ -115,25 +103,56 @@ class LrclibClient {
         }.getOrNull()
     }
 
-    private fun solveChallenge(prefix: String, target: String): String {
+    private suspend fun solveChallenge(prefix: String, target: String): String {
         var nonce = 0L
         val md = java.security.MessageDigest.getInstance("SHA-256")
+        val targetBytes = ByteArray(target.length / 2)
+        for (i in 0 until target.length step 2) {
+            targetBytes[i / 2] = target.substring(i, i + 2).toInt(16).toByte()
+        }
+        val prefixBytes = prefix.toByteArray()
+
         while (true) {
-            val attempt = "$prefix$nonce"
-            val hash = md.digest(attempt.toByteArray()).joinToString("") { "%02x".format(it) }
-            if (hash <= target) {
+            md.reset()
+            md.update(prefixBytes)
+            md.update(nonce.toString().toByteArray())
+            val hash = md.digest()
+
+            var isLowerOrEqual = true
+            for (i in 0 until minOf(hash.size, targetBytes.size)) {
+                val h = hash[i].toInt() and 0xFF
+                val t = targetBytes[i].toInt() and 0xFF
+                if (h < t) {
+                    isLowerOrEqual = true
+                    break
+                }
+                if (h > t) {
+                    isLowerOrEqual = false
+                    break
+                }
+            }
+
+            if (isLowerOrEqual) {
                 return nonce.toString()
             }
             nonce++
-            if (nonce % 10000 == 0L) {
-                if (Thread.interrupted()) throw InterruptedException()
+            if (nonce % 10000L == 0L) {
+                kotlinx.coroutines.yield()
             }
         }
     }
 
     private fun post(url: String, json: JSONObject, token: String?): Result<Unit> {
-        val response = postRaw(url, json, token) ?: return Result.failure(Exception("Network error or empty response"))
-        return Result.success(Unit)
+        return try {
+            val response = postRaw(url, json, token)
+            if (response != null) {
+                Result.success(Unit)
+            } else {
+                Result.failure(Exception("Empty response from server"))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
     }
 
     private fun postRaw(url: String, json: JSONObject, token: String?): String? {
@@ -150,20 +169,24 @@ class LrclibClient {
             }
         }
 
-        return runCatching {
+        return try {
             connection.outputStream.use { it.write(json.toString().toByteArray()) }
             val responseCode = connection.responseCode
             if (responseCode in 200..201) {
                 connection.inputStream.bufferedReader().use { it.readText() }
             } else {
                 val errorBody = connection.errorStream?.bufferedReader()?.use { it.readText() }
-                android.util.Log.e("LrclibClient", "POST error $responseCode: $errorBody")
+                Log.e("LrclibClient", "POST error $responseCode: $errorBody")
+                if (url.contains("publish")) {
+                    throw Exception("HTTP $responseCode: $errorBody")
+                }
                 null
             }
-        }.getOrElse {
-            android.util.Log.e("LrclibClient", "POST failed", it)
+        } catch (e: Exception) {
+            Log.e("LrclibClient", "POST failed for $url", e)
+            if (url.contains("publish")) throw e
             null
-        }.also {
+        } finally {
             connection.disconnect()
         }
     }
@@ -187,18 +210,18 @@ class LrclibClient {
             setRequestProperty("User-Agent", "LRCGET-Android/0.1.0")
         }
 
-        return runCatching {
+        return try {
             val responseCode = connection.responseCode
             if (responseCode == 200) {
                 connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
             } else {
-                android.util.Log.e("LrclibClient", "HTTP error $responseCode for $url")
+                Log.e("LrclibClient", "HTTP error $responseCode for $url")
                 null
             }
-        }.getOrElse {
-            android.util.Log.e("LrclibClient", "Request failed for $url", it)
+        } catch (e: Exception) {
+            Log.e("LrclibClient", "Request failed for $url", e)
             null
-        }.also {
+        } finally {
             connection.disconnect()
         }
     }

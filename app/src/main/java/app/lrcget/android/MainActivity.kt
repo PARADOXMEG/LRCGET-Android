@@ -1193,11 +1193,12 @@ private fun ContributePanel(
             CursorScrollableTextField(
                 value = durationStr,
                 onValueChange = { newValue ->
-                    val filtered = newValue.text.filter { !it.isLetter() }
+                    // Allow only numbers and symbols (like :)
+                    val filtered = newValue.text.filter { it.isDigit() || (!it.isLetter() && !it.isWhitespace()) }
                     durationStr = if (filtered == newValue.text) newValue else newValue.copy(text = filtered)
                 },
-                label = "Duration (seconds) *",
-                placeholder = "e.g. 354",
+                label = "Duration (Minutes and Seconds) *",
+                placeholder = "e.g. 5:54 or 354",
                 modifier = Modifier.fillMaxWidth().onFocusChanged { durationFocused.value = it.isFocused; updateFocus() },
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next)
             )
@@ -1233,7 +1234,16 @@ private fun ContributePanel(
 
         Button(
             onClick = {
-                val duration = durationStr.text.toIntOrNull() ?: 0
+                val durationText = durationStr.text
+                val duration = if (durationText.contains(":")) {
+                    val parts = durationText.split(":")
+                    val min = parts.getOrNull(parts.size - 2)?.toIntOrNull() ?: 0
+                    val sec = parts.getOrNull(parts.size - 1)?.toIntOrNull() ?: 0
+                    val hr = if (parts.size >= 3) parts.getOrNull(parts.size - 3)?.toIntOrNull() ?: 0 else 0
+                    hr * 3600 + min * 60 + sec
+                } else {
+                    durationText.toIntOrNull() ?: 0
+                }
                 onPublish(
                     trackName.text,
                     artistName.text,

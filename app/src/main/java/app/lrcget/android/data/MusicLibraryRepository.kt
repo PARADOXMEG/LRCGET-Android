@@ -279,7 +279,7 @@ class MusicLibraryRepository(private val context: Context) {
     }
 
     suspend fun getAllLyricsForPreview(track: TrackItem): List<LyricsLookupResult> = withContext(Dispatchers.IO) {
-        lrclibClient.findAllLyrics(track)
+        lrclibClient.findAllLyrics(track, syncedOnly = false)
     }
 
     suspend fun searchLyricsManual(
